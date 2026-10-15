@@ -1,0 +1,7 @@
+[package]
+name = "ra2-net"
+version = "0.1.0"
+edition = "2024"
+
+# No dependencies on purpose: std only, so it builds offline, and no ra2-sim or Bevy.
+[dependencies]
