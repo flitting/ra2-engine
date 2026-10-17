@@ -1,0 +1,12 @@
+[package]
+name = "ra2-formats"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+blowfish = "0.10.0"
+crc32fast = "1.5.2"
+lzo = "0.1.4"
+memmap2 = "0.9.11"
+num-bigint = "0.5.1"

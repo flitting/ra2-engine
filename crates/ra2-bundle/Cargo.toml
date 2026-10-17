@@ -1,0 +1,9 @@
+[package]
+name = "ra2-bundle"
+version = "0.1.0"
+edition = "2024"
+description = "Builds the game into a Mac app and a disk image to hand to players"
+
+[dependencies]
+ab_glyph = "0.2.32"
+image = { version = "0.25.10", default-features = false, features = ["png"] }

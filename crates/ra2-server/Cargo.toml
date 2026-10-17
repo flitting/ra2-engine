@@ -1,0 +1,9 @@
+[package]
+name = "ra2-server"
+version = "0.1.0"
+edition = "2024"
+
+# The meeting-place server for Internet games. It depends on the networking
+# crate alone: no simulation, no Bevy, no game files.
+[dependencies]
+ra2-net = { path = "../ra2-net" }

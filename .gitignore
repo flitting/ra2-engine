@@ -1,0 +1,15 @@
+/target
+/app_2229850/
+.DS_Store
+/.idea/
+
+# Local agent worktrees
+.claude/
+
+# Saved games
+saves/
+
+# Local settings
+settings.ini
+
+/private/
