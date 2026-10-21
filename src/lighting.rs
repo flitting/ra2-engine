@@ -140,8 +140,8 @@ pub enum LightRule {
     /// Through the cell's own tinted palette, as the ground: tiles, smudges,
     /// rocks, trees, bridges (`raise` levels up).
     Ground { raise: i32 },
-    /// Through a shared palette at the cell's brightness with no tint, plus a
-    /// fixed amount: buildings, vehicles, soldiers.
+    /// Through a shared palette at the cell's unscaled brightness plus the
+    /// class's extra light: buildings, vehicles, soldiers.
     Object { extra: i32 },
 }
 
@@ -152,6 +152,16 @@ pub struct Lit {
     pub level: i32,
     pub rule: LightRule,
 }
+
+/// Per-channel fixed-point palette multipliers. The depth shader applies them
+/// to stored colour bytes before RGB565 conversion, rather than linear light.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PaletteLight(pub [u32; 3]);
+
+/// ANIM.PAL's ordinary ConvertClass uses full Q16 rows, independently of the
+/// object colour scheme's MMX Q12 palette and reserved colour rules.
+#[derive(Component, Clone, Copy)]
+pub struct AnimationPalette;
 
 /// Whether a lightning storm rages, for the darkening. Whatever runs the storm
 /// sets it.
@@ -248,11 +258,14 @@ impl WorldLight {
     // A cell's brightness is the ambient light plus its sources, plus `Level`
     // per height level, less `Ground`, held to 0..2000. Its tint, the map's
     // plus the sources', is normalised so that the strongest channel is 1000.
-    // The ground is drawn at that brightness through the cell's palette, which
-    // carries the normalised tint; objects and the raised bridge level at the
-    // brightness times the strongest channel, objects through a shared
-    // untinted palette. Brightness picks a shade row (127 per 100%).
+    // Ground uses Cell.Intensity (scaled by the strongest tint), whereas normal
+    // objects use Cell.Ambient. The palette's shade count quantizes the alpha
+    // remap row a second time after the 0..254 brightness lookup.
     pub fn factor(&self, cell: (i32, i32), level: i32, rule: LightRule) -> [f32; 3] {
+        self.palette_light(cell, level, rule).0.map(|c| c as f32 / 65536.0)
+    }
+
+    pub fn palette_light(&self, cell: (i32, i32), level: i32, rule: LightRule) -> PaletteLight {
         let set = if self.storm { &self.setup.ion } else { &self.setup.normal };
         let (added, added_tint) = self.sums.get(&cell).copied().unwrap_or((0, [0; 3]));
         let raise = match rule {
@@ -261,21 +274,28 @@ impl WorldLight {
         };
         let brightness = (self.ambient * 10 + added + set.level * (level + raise) - set.ground).clamp(0, MAX_LIGHT);
         let tint: [i32; 3] = std::array::from_fn(|c| (self.setup.normal.tint[c] * 10 + added_tint[c]).clamp(0, MAX_LIGHT));
-        let strongest = tint.into_iter().max().unwrap_or(1000).max(1);
-        let scaled = (brightness * strongest / 1000).min(MAX_LIGHT);
-        let light = match rule {
-            LightRule::Ground { raise: 0 } => shade_step(brightness),
-            LightRule::Ground { .. } => shade_step(scaled),
-            LightRule::Object { extra } => shade_step(scaled) + extra,
+        let (scale, normalized, black) = normalize_tint(tint);
+        let scaled = if black { 0 } else { ((brightness as i64 * scale as i64) >> 16).min(MAX_LIGHT as i64) as i32 };
+        // Original default lighting detail 2 quantizes Cell palettes to 32;
+        // shared object/house palettes do not pass through this constructor.
+        let cell_tint = normalized.map(|c| c.clamp(0, 1000) & !31);
+        let (brightness, mut tint, count) = match rule {
+            LightRule::Ground { .. } => (scaled, cell_tint, if cell_tint.iter().sum::<i32>() < 2000 { 27 } else { 53 }),
+            LightRule::Object { extra } => (brightness.saturating_add(extra), [1000; 3], 53),
         };
         // While the storm rages every palette takes the `Ion` tint in place
         // of its own.
-        let channels: [i32; 3] = match (rule, self.storm) {
-            (_, true) => set.tint.map(|c| light * (c * 10).clamp(0, MAX_LIGHT) / 1000),
-            (LightRule::Ground { .. }, false) => tint.map(|c| light * c / strongest),
-            (LightRule::Object { .. }, false) => [light; 3],
-        };
-        channels.map(|c| c.max(0) as f32 / 1000.0)
+        if self.storm { tint = set.tint.map(|c| (c * 10).clamp(0, MAX_LIGHT)); }
+        PaletteLight(palette_factors(brightness, tint, count))
+    }
+
+    pub fn animation_palette_light(&self, cell: (i32, i32), level: i32) -> PaletteLight {
+        let set = if self.storm { &self.setup.ion } else { &self.setup.normal };
+        let added = self.sums.get(&cell).map_or(0, |sum| sum.0);
+        let brightness = (self.ambient * 10 + added + set.level * level - set.ground).clamp(0, MAX_LIGHT);
+        let shade = ((brightness as u32 * 261) >> 11).min(254);
+        let row = (127 * shade * 52 / 32258).min(52);
+        PaletteLight([row * 0x20000 / 52; 3])
     }
 
     /// The sprite colour for a picture with this light and see-through-ness.
@@ -284,36 +304,64 @@ impl WorldLight {
     }
 }
 
+/// Original 0x5558e0 normal-light normalization. Positive PC53/chop products
+/// are evaluated as binary rationals so host rounding cannot move a shade.
+fn normalize_tint(tint: [i32; 3]) -> (u32, [i32; 3], bool) {
+    let major = if tint[0] >= tint[1] && tint[0] >= tint[2] { 0 } else if tint[1] >= tint[2] { 1 } else { 2 };
+    // Exact binary double 0.001; the preceding integer product is exact.
+    let numerator = tint[major] as u128 * 65536 * 1_152_921_504_606_847;
+    let shift = (128 - numerator.leading_zeros()).saturating_sub(53);
+    let floating = (numerator >> shift) << shift;
+    let scale = (floating >> 60) as u32;
+    if scale < 66 { return (65536, [1000; 3], true) }
+    let normalized = std::array::from_fn(|i| {
+        if i == major { 1000 } else if major == 0 {
+            (((tint[i] as u128 * 65536) << 60) / floating) as i32
+        } else { (tint[i] as u64 * 65536 / scale as u64) as i32 }
+    });
+    (scale, normalized, false)
+}
+
+fn palette_factors(brightness: i32, tint: [i32; 3], count: u32) -> [u32; 3] {
+    let shade = ((brightness.clamp(0, MAX_LIGHT) as u32 * 261) >> 11).min(254);
+    let row = (127 * shade * (count - 1) / 32258).min(count - 1);
+    tint.map(|c| {
+        // Exact binary double 0.065536, followed by original ftol.
+        let q16 = (c.max(0) as u128 * 1000 * 4_722_366_482_869_645) >> 56;
+        (2 * row as u128 * q16 / (count - 1) as u128) as u32
+    })
+}
+
 /// A sprite colour that multiplies the art's palette colours by `factor`.
 // Sprites multiply in linear light; the engine multiplies the palette's
 // gamma-encoded values, so the factor is raised to the display's gamma.
 pub fn tint_colour(factor: [f32; 3], alpha: f32) -> Color {
-    let [r, g, b] = factor.map(|f| f.max(0.0).powf(2.2));
+    let [r, g, b] = linear_factor(factor);
     Color::LinearRgba(LinearRgba::new(r, g, b, alpha))
 }
 
-/// Rounds a brightness to one of the engine's shade steps and returns it in
-/// thousandths.
-// Brightness becomes a shade row, `brightness * 261 >> 11` capped at 254,
-// so 1000 is row 127.
-pub fn shade_step(brightness: i32) -> i32 {
-    let row = ((brightness.max(0) * 261) >> 11).min(254);
-    row * 1000 / 127
+pub(crate) fn linear_factor(factor: [f32; 3]) -> [f32; 3] {
+    factor.map(|f| f.max(0.0).powf(2.2))
 }
 
 /// Tints the sprites that carry a [`Lit`], when the light or their place has
 /// changed.
-pub fn apply(light: Option<Res<WorldLight>>, mut seen: Local<u64>, mut sprites: Query<(Ref<Lit>, &mut Sprite)>) {
+pub fn apply(mut commands: Commands, light: Option<Res<WorldLight>>, mut seen: Local<u64>, mut sprites: Query<(Entity, Ref<Lit>, &mut Sprite, Option<&crate::depth::Depth>, Option<&AnimationPalette>)>) {
     let Some(light) = light else {
         return;
     };
     let all = *seen != light.generation;
     *seen = light.generation;
-    for (lit, mut sprite) in &mut sprites {
+    for (entity, lit, mut sprite, depth, animation) in &mut sprites {
         if !all && !lit.is_changed() {
             continue;
         }
-        let wanted = light.colour(&lit, sprite.color.alpha());
+        let factor = if animation.is_some() { light.animation_palette_light(lit.cell, lit.level) }
+            else { light.palette_light(lit.cell, lit.level, lit.rule) };
+        let wanted = if depth.is_some() && std::env::var_os("RA2_NODEPTH").is_none() {
+            commands.entity(entity).insert(factor);
+            Color::WHITE.with_alpha(sprite.color.alpha())
+        } else { tint_colour(factor.0.map(|value| value as f32 / 65536.0), sprite.color.alpha()) };
         if sprite.color != wanted {
             sprite.color = wanted;
         }
@@ -323,6 +371,30 @@ pub fn apply(light: Option<Res<WorldLight>>, mut seen: Local<u64>, mut sprites: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_palette_and_cell_light_boundary_samples() {
+        // Pinned original Cell.CalculateLighting, LightConvert.UpdateColors
+        // and AlphaLightingRemap runs; these include PC53 truncation edges.
+        for (tint, expected) in [
+            ([880; 3], (57671, [1000, 999, 999], false)),
+            ([800, 700, 1000], (65536, [800, 700, 1000], false)),
+            ([1200; 3], (78643, [1000; 3], false)),
+            ([0; 3], (65536, [1000; 3], true)),
+            ([1; 3], (65536, [1000; 3], true)),
+            ([999, 1000, 999], (65536, [999, 1000, 999], false)),
+        ] { assert_eq!(normalize_tint(tint), expected); }
+        assert_eq!(palette_factors(782, [1000; 3], 53), [50411; 3]);
+        assert_eq!(palette_factors(688, [1000, 999, 999], 53), [42849, 42807, 42807]);
+        assert_eq!(palette_factors(1000, [1000; 3], 53), [65535; 3]);
+        assert_eq!(palette_factors(1000, [0, 0, 1000], 27), [0, 0, 65535]);
+        let normal = LightSet { ambient: 80, tint: [88; 3], ground: 50, level: 8 };
+        let light = WorldLight::new(LightSetup { normal, ..default() });
+        assert_eq!(light.palette_light((0, 0), 4, LightRule::Object { extra: 0 }), PaletteLight([50411; 3]));
+        assert_eq!(light.animation_palette_light((0, 0), 4), PaletteLight([50412; 3]));
+        assert_eq!(light.palette_light((0, 0), 4, LightRule::Ground { raise: 0 }), PaletteLight([42507; 3]));
+        assert_eq!(light.palette_light((0, 0), 0, LightRule::Object { extra: 15 }), PaletteLight([47890; 3]));
+    }
 
     fn setup() -> LightSetup {
         let normal = LightSet { ambient: 85, tint: [100, 100, 100], ground: 0, level: 32 };

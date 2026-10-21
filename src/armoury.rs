@@ -37,6 +37,9 @@ pub struct WarheadLook {
 
 #[derive(Default, bevy::prelude::Resource, Clone)]
 pub struct Armoury {
+    /// RA2's MindControl Damage is an offensive-threat value; YR changed it
+    /// into the number of links. Keep that edition distinction when importing.
+    single_link_mind_control: bool,
     pub weapons: Vec<Weapon>,
     pub warheads: Vec<Warhead>,
     pub projectiles: Vec<Projectile>,
@@ -118,7 +121,12 @@ fn triple(value: Option<&str>) -> Option<(i32, i32, i32)> {
 
 impl Armoury {
     pub fn load(rules: &Ini) -> Self {
+        Self::load_for_edition(rules, crate::files::Edition::RedAlert2)
+    }
+
+    pub fn load_for_edition(rules: &Ini, edition: crate::files::Edition) -> Self {
         let mut armoury = Self {
+            single_link_mind_control: edition == crate::files::Edition::RedAlert2,
             splashes: list(rules.get("CombatDamage", "SplashList")),
             infantry_deaths: {
                 let name = |key: &str| ["AudioVisual", "General", "CombatDamage"].iter().find_map(|section| rules.get(section, key)).map(|v| v.split(';').next().unwrap_or("").trim().to_owned()).filter(|v| !v.is_empty());
@@ -294,6 +302,7 @@ impl Armoury {
             limbo_launch: yes(get("LimboLaunch"), false),
             spawner: yes(get("Spawner"), false),
             infinite_mind_control: yes(get("InfiniteMindControl"), false),
+            mind_control_capacity: (self.single_link_mind_control && self.warheads.get(warhead as usize).is_some_and(|warhead| warhead.mind_control)).then_some(1),
             fake_blink: number("DisguiseFakeBlinkTime").unwrap_or(0).max(0) as u32,
             area_fire: yes(get("AreaFire"), false),
             is_sonic: yes(get("IsSonic"), false),

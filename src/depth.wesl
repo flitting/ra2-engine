@@ -8,14 +8,14 @@ import bevy_sprite_render::{
 
 @if(TONEMAP_IN_SHADER)
 import bevy_core_pipeline::tonemapping;
-@if(SRGB_OUTPUT)
-import bevy_render::color_operations::linear_to_srgb;
+import bevy_render::color_operations::{linear_to_srgb, srgb_to_linear};
 @if(OKLAB_OUTPUT)
 import bevy_render::color_operations::linear_rgb_to_oklab;
 
 // Mode, depth shape offset x and y, unused.
 @group(constants::MATERIAL_BIND_GROUP) @binding(20) var<uniform> params: vec4<i32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(21) var shape: texture_2d<i32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(22) var<uniform> palette_light: vec4<u32>;
 
 struct Output {
     @location(0) color: vec4<f32>,
@@ -34,9 +34,27 @@ fn texel(uv: vec2<f32>, size: vec2<u32>) -> vec2<i32> {
     return vec2<i32>(floor(uv * vec2<f32>(size)));
 }
 
+fn palette_rgb(linear: vec3<f32>, light: vec3<u32>) -> vec3<f32> {
+    let bytes = vec3<u32>(round(clamp(linear_to_srgb(linear), vec3(0.0), vec3(1.0)) * 255.0));
+    // Object LightConvert uses the MMX Q12 path; ordinary ANIM.PAL Convert
+    // builds each palette row with the full Q16 factor.
+    var shaded = (bytes * (light >> vec3(4u))) >> vec3(12u);
+    if params.w == 2 {
+        shaded = (bytes * light) >> vec3(16u);
+    }
+    shaded = min(vec3(255u), shaded);
+    let packed = shaded >> vec3(3u, 2u, 3u);
+    let expanded = (packed << vec3(3u, 2u, 3u)) | (packed >> vec3(2u, 4u, 2u));
+    return srgb_to_linear(vec3<f32>(expanded) / 255.0);
+}
+
 @fragment
 fn fragment(mesh: VertexOutput) -> Output {
-    var color = sprite_functions::sample_final_color(mesh.uv, mesh.instance_index);
+    var base = sprite_functions::sample_sprite_texture(mesh.uv, mesh.instance_index);
+    if params.w != 0 {
+        base = vec4(palette_rgb(base.rgb, palette_light.rgb), base.a);
+    }
+    var color = sprite_functions::get_final_color(base, mesh.instance_index);
     if color.a <= 0.0 {
         discard;
     }

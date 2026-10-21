@@ -47,6 +47,9 @@ pub struct ScoreBoard {
     pub seconds: u64,
     pub games: u32,
     pub side: ScoreSide,
+    /// The actual local-player result read from world.over, also used to
+    /// choose retry/advance for an active campaign.
+    pub won: bool,
 }
 
 /// The names of the houses, by owner, for messages and the score screen.
@@ -63,13 +66,24 @@ struct Progress {
     leave_at: Option<f64>,
 }
 
+fn score_due(world: &ra2_sim::World, progress: &mut Progress, now: f64) -> bool {
+    if world.over.is_none() { return false; }
+    // Campaign World.over is the result of the completed House.AI delay and
+    // audio wait. Logic has stopped there; the original main loop dispatches
+    // its scenario result without waiting for any more logical frames.
+    if world.mission_data.is_some() { return true; }
+    let Some((_, ended)) = progress.result else { return false; };
+    if world.current_tick() < ended + 90 { return false; }
+    now >= *progress.leave_at.get_or_insert(now + 4.0)
+}
+
 pub struct EndGamePlugin;
 
 impl Plugin for EndGamePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ScoreBoard>()
             .init_resource::<HouseNames>()
-            .add_systems(Update, watch.run_if(in_state(Screen::InGame)).run_if(resource_exists::<Sim>).run_if(resource_exists::<UnitView>));
+            .add_systems(Update, watch.after(crate::campaign::CampaignOutcomeSet).run_if(in_state(Screen::InGame)).run_if(resource_exists::<Sim>).run_if(resource_exists::<UnitView>));
     }
 }
 
@@ -113,39 +127,28 @@ fn watch(
     };
     let now = time.elapsed_secs_f64();
     if progress.result.is_none() {
-        // The banner is frame 2
-        // (victory) or 3 (loss) of GRFXTXT.SHP in the middle of the map view,
-        // with "you are victorious" or "you have lost" spoken.
         let won = left.contains(&local());
         progress.result = Some((won, world.current_tick()));
-        cues.write(Cue::Eva(if won { "EVA_YouAreVictorious" } else { "EVA_YouHaveLost" }));
-        let (width, height) = (window.width() - SIDEBAR_WIDTH, window.height() - BOTTOM_BAR_HEIGHT);
-        match load(&files, &mut images, "grfxtxt.shp", if won { 2 } else { 3 }, "grfxtxt.pal") {
-            Some((image, size)) => {
-                commands.spawn((
-                    DespawnOnExit(Screen::InGame),
-                    GlobalZIndex(50),
-                    absolute(((width - size.x) / 2.0).floor(), ((height - size.y) / 2.0).floor(), size),
-                    ImageNode::new(image),
-                    Pickable::IGNORE,
-                ));
+        // Campaign House.Win/Lose already queued its distinct mission speech
+        // when the request was accepted, before the SavourDelay/audio wait.
+        if world.mission_data.is_none() {
+            cues.write(Cue::Eva(if won { "EVA_YouAreVictorious" } else { "EVA_YouHaveLost" }));
+            let (width, height) = (window.width() - SIDEBAR_WIDTH, window.height() - BOTTOM_BAR_HEIGHT);
+            match load(&files, &mut images, "grfxtxt.shp", if won { 2 } else { 3 }, "grfxtxt.pal") {
+                Some((image, size)) => {
+                    commands.spawn((
+                        DespawnOnExit(Screen::InGame),
+                        GlobalZIndex(50),
+                        absolute(((width - size.x) / 2.0).floor(), ((height - size.y) / 2.0).floor(), size),
+                        ImageNode::new(image),
+                        Pickable::IGNORE,
+                    ));
+                }
+                None => warn!("grfxtxt.shp not found: no banner"),
             }
-            None => warn!("grfxtxt.shp not found: no banner"),
         }
     }
-    // The game runs on for `SavourDelay` (90 frames), then waits for the
-    // announcer (up to two seconds, and up to five more) before the score
-    // screen.
-    let Some((_, ended)) = progress.result else {
-        return;
-    };
-    if world.current_tick() < ended + 90 {
-        return;
-    }
-    let leave_at = *progress.leave_at.get_or_insert(now + 4.0);
-    if now < leave_at {
-        return;
-    }
+    if !score_due(world, &mut progress, now) { return; }
     // A row for each house; a house not defeated
     // shows its points and half as much again and a random half to whole more;
     // the highest score first.
@@ -168,6 +171,7 @@ fn watch(
     board.seconds = world.current_tick() / 60;
     board.games += 1;
     board.side = world.houses.get(local() as usize).map_or(ScoreSide::Allied, |house| ScoreSide::from_house_side(house.side));
+    board.won = progress.result.is_some_and(|(won, _)| won);
     *progress = Progress::default();
     next_screen.set(Screen::Score);
 }
@@ -182,5 +186,58 @@ mod tests {
         assert_eq!(ScoreSide::from_house_side(1), ScoreSide::Soviet);
         assert_eq!(ScoreSide::from_house_side(2), ScoreSide::Yuri);
         assert_eq!(ScoreSide::from_house_side(-1), ScoreSide::Allied);
+    }
+
+    #[test]
+    fn campaign_score_waits_for_the_core_result_and_accepts_its_frozen_frame() {
+        use ra2_sim::{House, Map, World, mission::*};
+        for yuri in [false, true] {
+            for action in [1, 2] {
+                let mut world = World::new(Map::new(16, 16), None);
+                world.houses = vec![House::default(), House { country: 1, human: true, ..House::default() }];
+                world.attach_mission(MissionData {
+                    id: "score-lifecycle".into(), yuri, player_house: 1,
+                    houses: vec![HouseBinding { name: "Player House".into(), country: "Player".into(), house: 1 }],
+                    country_names: vec!["Neutral".into(), "Player".into()],
+                    tags: vec![TagDef { id: "result-tag".into(), trigger: "result".into(), ..TagDef::default() }],
+                    triggers: vec![TriggerDef { id: "result".into(), country: "Player".into(),
+                        events: vec![EventDef { kind: 8, ..EventDef::default() }],
+                        actions: vec![ActionDef::with_parameter(action, "1")], ..TriggerDef::default() }],
+                    ..MissionData::default()
+                }).unwrap();
+                world.set_mission_presentation_managed(true);
+                let mut progress = Progress::default();
+                for _ in 0..200 {
+                    assert!(!score_due(&world, &mut progress, 10.0));
+                    world.tick();
+                    if world.mission_presentation_waiting() { break; }
+                }
+                assert!(world.mission_presentation_waiting());
+                assert!(!score_due(&world, &mut progress, 10.0));
+                assert!(!world.advance_mission_presentation_time(0, true));
+                assert!(!score_due(&world, &mut progress, 10.0));
+                assert!(world.advance_mission_presentation_time(0, false));
+                let frozen_tick = world.current_tick();
+                progress.result = Some((action == 1, frozen_tick));
+                for _ in 0..100 { world.tick(); }
+                assert_eq!(world.current_tick(), frozen_tick);
+                assert!(score_due(&world, &mut progress, 10.0), "the completed campaign cannot wait for another logic frame");
+                assert!(progress.leave_at.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn skirmish_score_retains_its_existing_frame_and_wall_time_delays() {
+        let mut world = ra2_sim::World::new(ra2_sim::Map::new(16, 16), None);
+        world.over = Some(Vec::new());
+        let mut progress = Progress { result: Some((false, 0)), ..Progress::default() };
+        for _ in 0..89 { world.tick(); }
+        assert!(!score_due(&world, &mut progress, 10.0));
+        assert!(progress.leave_at.is_none());
+        world.tick();
+        assert!(!score_due(&world, &mut progress, 10.0));
+        assert!(!score_due(&world, &mut progress, 13.99));
+        assert!(score_due(&world, &mut progress, 14.0));
     }
 }

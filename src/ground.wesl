@@ -5,8 +5,7 @@ import bevy_sprite_render::{
 
 @if(TONEMAP_IN_SHADER)
 import bevy_core_pipeline::tonemapping;
-@if(SRGB_OUTPUT)
-import bevy_render::color_operations::linear_to_srgb;
+import bevy_render::color_operations::{linear_to_srgb, srgb_to_linear};
 @if(OKLAB_OUTPUT)
 import bevy_render::color_operations::linear_rgb_to_oklab;
 
@@ -25,6 +24,14 @@ fn fragment(mesh: VertexOutput) -> Output {
     if color.a <= 0.0 {
         discard;
     }
+    // LightConvert multiplies palette bytes, truncates, then stores RGB565.
+    // Vertex GBA holds exact Q16 integers; red remains the tile's depth.
+    let bytes = vec3<u32>(round(clamp(linear_to_srgb(color.rgb), vec3(0.0), vec3(1.0)) * 255.0));
+    let q12 = vec3<u32>(round(mesh.color.gba)) >> vec3(4u);
+    let shaded = min(vec3(255u), (bytes * q12) >> vec3(12u));
+    let packed = shaded >> vec3(3u, 2u, 3u);
+    let expanded = (packed << vec3(3u, 2u, 3u)) | (packed >> vec3(2u, 4u, 2u));
+    color = vec4(srgb_to_linear(vec3<f32>(expanded) / 255.0), color.a);
     // A tile pixel's depth is its tile's base plus its own depth byte.
     let d = i32(round(mesh.color.r)) + i32(textureLoad(heights, at, 0).r);
 

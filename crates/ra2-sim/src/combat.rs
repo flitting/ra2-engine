@@ -138,6 +138,10 @@ pub struct Weapon {
     pub damage: i32,
     /// Yuri's Revenge `InfiniteMindControl`: no link cap; overload rules apply.
     pub infinite_mind_control: bool,
+    /// Override the link limit independently from offensive Damage. RA2's
+    /// Yuri uses one link even though its weapon has Damage=10; YR normally
+    /// uses Damage as its finite limit. None retains that YR/default rule.
+    pub mind_control_capacity: Option<i32>,
     /// Frames between shots.
     pub rof: i32,
     /// `Range` and `MinimumRange` in leptons; a range of -512 is "anywhere".
@@ -181,6 +185,7 @@ impl Default for Weapon {
             fake_blink: 0,
             damage: 0,
             infinite_mind_control: false,
+            mind_control_capacity: None,
             rof: 0,
             range: 0,
             minimum_range: 0,
@@ -366,7 +371,7 @@ pub enum Aim {
 pub struct Arms {
     pub target: Option<Aim>,
     /// The target was picked by the unit itself, not ordered.
-    passive: bool,
+    pub(crate) passive: bool,
     /// Ordered to attack: it closes with the target and keeps at it.
     pub attacking: bool,
     /// The tick the weapon is ready again, and the wait it was given.
@@ -648,6 +653,7 @@ pub(crate) fn spread_offsets(rings: i32) -> Vec<(i32, i32)> {
 impl World {
     /// Takes something off the map as destroyed.
     pub(crate) fn kill(&mut self, who: Aim) {
+        if self.alive(who) { self.register_mission_destruction(who, false); }
         self.dying.push((who, 0));
         self.bury();
     }
@@ -1012,7 +1018,7 @@ impl World {
         };
         if self.warheads.get(weapon.warhead as usize).is_some_and(|w| w.mind_control) {
             if let (Aim::Unit(controller) | Aim::Building(controller), Aim::Unit(victim)) = (by, target) {
-                if !self.can_capture_mind(controller, victim, weapon.damage, weapon.infinite_mind_control) { return false; }
+                if !self.can_capture_mind(controller, victim, weapon.mind_control_capacity.unwrap_or(weapon.damage), weapon.infinite_mind_control) { return false; }
             }
         }
         let Some(projectile) = self.projectiles.get(weapon.projectile as usize).cloned() else {
@@ -1030,6 +1036,7 @@ impl World {
                     unit.health = 0;
                     unit.died_by_suicide = true;
                 }
+                self.register_mission_destruction(by, true);
                 if !self.dying.iter().any(|(who, _)| *who == by) {
                     self.dying.push((by, 0));
                 }
@@ -1372,8 +1379,13 @@ impl World {
         }
         *health = (*health - damage).max(0);
         let dead = *health == 0;
+        if !dead {
+            self.register_mission_attacked(victim, source);
+        }
         self.note_attack(victim, damage, source);
         if dead {
+            let has_attacker = source.is_some_and(|attacker| self.has_registered_mission_object(attacker));
+            self.register_mission_destruction(victim, has_attacker);
             self.record_kill(victim, source);
             self.score_kill(victim, source);
             self.slave_host_died(victim, source.and_then(|who| self.owner_of(who)));
@@ -1424,7 +1436,7 @@ impl World {
                 (Some(a), Some(b)) => (((a.0 - b.0) as f64).hypot((a.1 - b.1) as f64) as i32) <= (fighter.sight * 256 + 128),
                 _ => false,
             };
-            if hostile && fighter.can_retaliate && fighter.primary.is_some() {
+            if hostile && fighter.can_retaliate && fighter.primary.is_some() && self.unit_mission_retaliates(id) {
                 if let Some(unit) = self.units.iter_mut().find(|u| u.id == id) {
                     let idle = unit.arms.target.is_none() && unit.dest.is_none() && unit.work.job == Job::Idle;
                     if idle && near {
@@ -1453,6 +1465,7 @@ impl World {
                     && unit.stance == Stance::Standing
                     && unit.falling.is_none()
                     && (!human || unit.has_ability(crate::abilities::ability::SCATTER))
+                    && self.unit_mission_scatters(id)
             });
             if steps {
                 self.scatter_unit(id);
@@ -1719,7 +1732,7 @@ impl World {
             return;
         }
         let others: Vec<Other> = self.others();
-        let open = entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), &others, &self.buildings, unit, wanted, None, wanted, -1) == code::OK;
+        let open = entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, unit, wanted, None, wanted, -1) == code::OK;
         let cell = if open { Some(wanted) } else { nearby(&self.map, &self.claims, &self.spots, unit, wanted, crate::Near::new(false, true, Some(wanted)), self.tick) };
         let Some(cell) = cell.filter(|&cell| cell != unit.cell()) else {
             return;
@@ -1740,6 +1753,7 @@ impl World {
             };
             if let Some(old) = self.map.index(from.0.div_euclid(LEPTONS_PER_CELL), from.1.div_euclid(LEPTONS_PER_CELL)) {
                 self.spots[old] &= !(1 << spot_index(from.0, from.1));
+                if spot_index(from.0, from.1) == 0 && self.spots[old] & SPOT_BITS == 0 { self.spot_house[old] = u8::MAX; }
             }
             self.spots[at] |= 1 << spot;
             self.spot_house[at] = owner;
@@ -1750,6 +1764,7 @@ impl World {
                     *claim = 0;
                 }
             }
+            self.remove_stacked_claims(id);
             self.claims[at] = id + 1;
         }
         let distance = (((x - from.0) as f64).hypot((y - from.1) as f64)) as i32;
@@ -1758,15 +1773,20 @@ impl World {
             delay = self.chrono.1;
         }
         let tick = self.tick;
+        let on_bridge = self.mission_data.as_ref().map(|_| self.map.bridged(cell.0, cell.1));
         let unit = &mut self.units[index];
         unit.x = x;
         unit.y = y;
         unit.dest = None;
         unit.drop_path();
         unit.head_to = None;
+        if let Some(on_bridge) = on_bridge { unit.on_bridge = on_bridge; }
         unit.warp_until = tick + delay.max(0) as u64;
         let to = (x, y, self.ground_z(x, y));
         self.events.push(Event::Teleported { kind, from, to });
+        // Teleport.Process explicitly sends PCP.End after SetLocation/Mark,
+        // rather than relying on a generic placement or coordinate hook.
+        self.register_mission_cell_entry(id);
     }
 
     /// What a unit walking into a building would do there, if anything.
@@ -1878,7 +1898,7 @@ impl World {
             .collect();
         let others: Vec<Other> = self.others();
         let free = |world: &Self, who: &Unit, cell: (i32, i32)| {
-            entry_code(&world.map, &world.claims, (&world.spots, &world.spot_house), &others, &world.buildings, who, cell, None, cell, -1) == code::OK
+            entry_code(&world.map, &world.claims, &world.stacked_claims, (&world.spots, &world.spot_house), &others, &world.buildings, who, cell, None, cell, -1) == code::OK
         };
         let Some(exit) = order.iter().copied().find(|&cell| free(self, &occupants[0], cell)) else {
             self.buildings[index].occupants = occupants;
@@ -1930,8 +1950,12 @@ impl World {
     // The building takes its whole health in damage
     // from the absolute warhead: it is destroyed.
     pub(crate) fn detonate_charges(&mut self) {
-        let due: Vec<u32> = self.buildings.iter().filter(|b| b.c4.is_some_and(|(at, _)| self.tick >= at)).map(|b| b.id).collect();
-        for id in due {
+        let due: Vec<(u32, u32)> = self.buildings.iter().filter_map(|building| building.c4.filter(|(at, _)| self.tick >= *at).map(|(_, attacker)| (building.id, attacker))).collect();
+        for (id, attacker) in due {
+            // Native C4 stores the applying Infantry pointer, not an attacking
+            // House. A still-registered off-map soldier also permits Event7;
+            // pointer expiration leaves only Event48.
+            self.register_mission_destruction(Aim::Building(id), self.has_registered_mission_object(Aim::Unit(attacker)));
             self.kill(Aim::Building(id));
         }
     }
@@ -1973,8 +1997,42 @@ impl World {
     // is whole again and the engineer used up; with nothing to mend the engineer
     // is kept.
     pub(crate) fn enter_buildings(&mut self) {
+        self.enter_buildings_for(None);
+    }
+
+    /// Resume the accepted UpdatePosition entry branch synchronously, before
+    /// the next Foot moves. Other sessions keep the established fight phase.
+    pub(crate) fn complete_campaign_building_entry(&mut self, id: u32) -> bool {
+        let Some(yuri) = self.mission_data.as_ref().map(|data| data.yuri) else { return false; };
+        let Some(index) = self.units.iter().position(|unit| unit.id == id && unit.health > 0) else { return false; };
+        let unit = &self.units[index];
+        if unit.drive.is_some() || unit.head_to.is_some() || unit.turn.remaining > 0 { return false; }
+        let Some(target) = unit.capture else { return false; };
+        let cell = unit.cell();
+        let near = self.buildings.iter().find(|building| building.id == target).is_some_and(|building| {
+            (building.cell.0..building.cell.0 + building.size.0).contains(&cell.0) && (building.cell.1..building.cell.1 + building.size.1).contains(&cell.1)
+        });
+        let Some(entry) = self.entry_action(id, target).filter(|_| near) else { return false; };
+        if !unit.stats.infantry && !(yuri && matches!(entry, Entry::Grind | Entry::Absorb)) { return false; }
+        self.units[index].dest = None;
+        self.units[index].drop_path();
+        self.enter_buildings_for(Some(id));
+        // Native UnInit removes consumed Infantry before the next Foot, rather
+        // than leaving a live blocker until the common combat burial phase.
+        if let Some(at) = self.dying.iter().position(|entry| *entry == (Aim::Unit(id), VANISHED)) {
+            let consumed = self.dying.remove(at);
+            let pending = std::mem::take(&mut self.dying);
+            self.dying.push(consumed);
+            self.bury();
+            self.dying.splice(0..0, pending);
+        }
+        true
+    }
+
+    fn enter_buildings_for(&mut self, only: Option<u32>) {
         for index in 0..self.units.len() {
             let unit = &self.units[index];
+            if only.is_some_and(|id| id != unit.id) { continue; }
             let Some(target) = unit.capture else {
                 continue;
             };
@@ -1993,17 +2051,28 @@ impl World {
             // coming to rest on a cell of the building itself.
             let near = (building.cell.0..building.cell.0 + building.size.0).contains(&cell.0)
                 && (building.cell.1..building.cell.1 + building.size.1).contains(&cell.1);
-            let (id, owner) = (unit.id, unit.owner);
-            match self.entry_action(id, target).filter(|_| near) {
+            let (id, owner, infantry, from) = (unit.id, unit.owner, unit.stats.infantry, building.owner);
+            let action = self.entry_action(id, target).filter(|_| near);
+            // These callbacks target the destination's Tag with the entering
+            // object as owner and EmptyCell. They precede occupancy, refunds,
+            // owner changes and the entrant's consumption Event48.
+            if action.is_some() && (infantry || (action == Some(Entry::Grind) && self.mission_data.as_ref().is_some_and(|data| data.yuri))) {
+                self.register_mission_building_entry(id, target);
+            }
+            match action {
                 Some(Entry::Grind) => {
                     let Some(index) = self.units.iter().position(|u| u.id == id) else { continue };
                     let refund = self.kind_of(&self.units[index]).map_or(0, |k| k.soylent.unwrap_or((k.cost as f64 * self.refund_percent) as i32)).max(0);
+                    if let Some(house) = self.houses.get_mut(owner as usize) { house.credits = house.credits.saturating_add(refund); }
+                    // Mission Eaten pays first, raises the consumed object's
+                    // 48 (never 7), then UnInit liberates its Team membership.
+                    self.register_mission_destruction(Aim::Unit(id), false);
                     self.release_mind(id);
                     self.detach_mind_control(id);
+                    if let Some((team, owner)) = self.unit(id).and_then(|unit| unit.team.map(|team| (team, unit.owner))) { self.liberate_campaign_tag(team, id, owner); }
                     let removed = self.lift(index);
                     if let Some(spawner) = removed.spawner { self.orphan_spawns(&spawner); }
-                    if let Some(house) = self.houses.get_mut(owner as usize) { house.credits = house.credits.saturating_add(refund); }
-                    return self.enter_buildings();
+                    return self.enter_buildings_for(only);
                 }
                 Some(Entry::Absorb) => {
                     let Some(index) = self.units.iter().position(|u| u.id == id) else { continue };
@@ -2014,7 +2083,7 @@ impl World {
                     passenger.head_to = None;
                     passenger.drop_path();
                     self.buildings[at].occupants.push(passenger);
-                    return self.enter_buildings();
+                    return self.enter_buildings_for(only);
                 }
                 // The building is wired to go off
                 // `C4Delay` later (27 frames), unless it is being sold; the
@@ -2051,11 +2120,14 @@ impl World {
                     soldier.drop_path();
                     self.buildings[at].occupants.push(soldier);
                     // The list of units is one shorter: look at this place again.
-                    return self.enter_buildings();
+                    return self.enter_buildings_for(only);
                 }
                 Some(Entry::Capture) => {
-                    let from = building.owner;
-                    let kind = self.building_types.get(building.kind as usize).cloned();
+                    let kind = self.building_types.get(self.buildings[at].kind as usize).cloned();
+                    // Retail Infantry re-reads the building's Tag and raises1
+                    // a second time in the accepted enemy-capture branch.
+                    if infantry { self.register_mission_building_entry(id, target); }
+                    self.share_capture_mission_tag(id, target);
                     let taken = kind.as_ref().is_some_and(|k| {
                         k.factory.is_some()
                             && !self.buildings.iter().any(|b| {
@@ -2080,25 +2152,30 @@ impl World {
                     building.repairing = false;
                     building.arms = Arms::default();
                     self.events.push(Event::Captured { building: target, by: owner, from });
+                    self.register_mission_destruction(Aim::Unit(id), false);
                     self.dying.push((Aim::Unit(id), VANISHED));
                 }
                 // The spy is used up.
                 Some(Entry::Infiltrate) => {
                     self.infiltrate(at, owner);
+                    self.register_mission_destruction(Aim::Unit(id), false);
                     self.dying.push((Aim::Unit(id), VANISHED));
                 }
                 // The
                 // bridge is put back and the engineer is used up.
                 Some(Entry::RepairBridge) => {
+                    let building = &self.buildings[at];
                     let centre = (building.cell.0 + building.size.0 / 2, building.cell.1 + building.size.1 / 2);
                     self.repair_bridge(centre);
                     self.events.push(Event::BridgeRepaired { house: owner, cell: centre });
+                    self.register_mission_destruction(Aim::Unit(id), false);
                     self.dying.push((Aim::Unit(id), VANISHED));
                 }
                 Some(Entry::Repair) => {
-                    let strength = self.building_types.get(building.kind as usize).map_or(1, |k| k.strength);
+                    let strength = self.building_types.get(self.buildings[at].kind as usize).map_or(1, |k| k.strength);
                     self.buildings[at].health = strength;
                     self.events.push(Event::Mended { building: target, owner });
+                    self.register_mission_destruction(Aim::Unit(id), false);
                     self.dying.push((Aim::Unit(id), VANISHED));
                 }
                 _ => {}
@@ -2519,7 +2596,7 @@ impl World {
                     continue;
                 }
                 let clear = cell == unit.cell()
-                    || entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), &others, &self.buildings, unit, cell, None, cell, -1) == code::OK;
+                    || entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, unit, cell, None, cell, -1) == code::OK;
                 let reachable = self.map.zones().is_none_or(|zones| {
                     let zone = unit.stats.movement_zone as usize;
                     let _ = zones;
@@ -2545,7 +2622,7 @@ impl World {
                         continue;
                     }
                     let zone = unit.stats.movement_zone as usize;
-                    let free = round == unit.cell() || entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), &others, &self.buildings, unit, round, None, round, -1) == code::OK;
+                    let free = round == unit.cell() || entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, unit, round, None, round, -1) == code::OK;
                     if free && self.map.zone_on(round, zone, self.map.deck(round.0, round.1)) == self.map.zone_on(unit.cell(), zone, unit.on_bridge) {
                         if round != unit.cell() {
                             self.send(index, round);
@@ -2683,6 +2760,9 @@ impl World {
             if fighter.primary.is_none() || unit.tethered || unit.health <= 0 || unit.plane.is_some() {
                 continue;
             }
+            if matches!(self.unit_mission(unit.id), Some(crate::mission::UnitMission::Sleep | crate::mission::UnitMission::Harmless)) {
+                continue;
+            }
             // One held by a `Temporal` weapon does nothing at all.
             if unit.frozen.is_some() || self.tick < unit.warp_until || self.tick < unit.paralysed_until || matches!(unit.stance, Stance::Deploying(_) | Stance::Undeploying(_)) {
                 continue;
@@ -2700,6 +2780,7 @@ impl World {
             let me = Aim::Unit(unit.id);
             let at = (unit.x, unit.y, self.ground_z(unit.x, unit.y) + self.altitude(unit));
             let (owner, body) = (unit.owner, unit.facing);
+            let guard_area = self.unit_mission(unit.id).map_or(fighter.default_guard_area, |mission| mission == crate::mission::UnitMission::AreaGuard);
             let mut arms = unit.arms;
             let moving = unit.dest.is_some();
             let infantry = unit.stats.infantry;
@@ -2720,7 +2801,7 @@ impl World {
             // A unit on its way into something is on another mission.
             let idle = !moving && unit.work.job == Job::Idle && unit.falling.is_none() && unit.capture.is_none() && unit.boarding.is_none();
             let scan_due = self.tick >= arms.scan_at;
-            if self.tick >= arms.scan_at && fighter.can_passive_acquire && (idle || fighter.opportunity_fire) && !arms.attacking {
+            if self.tick >= arms.scan_at && fighter.can_passive_acquire && (idle || fighter.opportunity_fire) && !arms.attacking && self.unit_mission_passive(unit.id) {
                 arms.scan_at = self.tick + self.targeting_delay as u64 + (self.next_random() % 3) as u64;
                 if arms.target.is_some() && arms.passive {
                     let index_w = self.select_weapon_of(owner, &fighter, arms.target.unwrap());
@@ -2741,7 +2822,7 @@ impl World {
             // no target it looks from the post out to its area range and goes
             // after what it finds; stopped further from the post than three
             // quarters of that range, it drops its target and goes back.
-            if fighter.default_guard_area {
+            if guard_area {
                 let here = self.units[index].cell();
                 // (An order clears the post; the next place it stops is it.)
                 if !moving && arms.target.is_none() && self.units[index].post.is_none() && idle {
@@ -2889,6 +2970,14 @@ impl World {
                                 arms.target = None;
                             } else if !moving {
                                 if arms.attacking || fighter.can_approach_target {
+                                    // A campaign Area Guard can acquire its
+                                    // first target in this very combat pass.
+                                    // approach reports failure through live
+                                    // Arms, so give it the newly acquired
+                                    // target before reading that result back.
+                                    if self.unit_mission(self.units[index].id).is_some() {
+                                        self.units[index].arms = arms;
+                                    }
                                     self.approach(index, target, &weapon);
                                     // (What the search settled is taken up into the copy
                                     // that is written back below.)
@@ -2915,6 +3004,9 @@ impl World {
                                     ((cx - to.0) as f64).hypot((cy - to.1) as f64) as i32 > weapon.range
                                 });
                                 if flying || stale {
+                                    if self.unit_mission(self.units[index].id).is_some() {
+                                        self.units[index].arms = arms;
+                                    }
                                     self.approach(index, target, &weapon);
                                     // (What the search settled is taken up into the copy
                                     // that is written back below.)
@@ -3185,6 +3277,9 @@ impl World {
                     };
                     self.release_mind(id);
                     self.detach_mind_control(id);
+                    if let Some((team, owner)) = self.units.get(index).and_then(|unit| unit.team.map(|team| (team, unit.owner))) {
+                        self.liberate_campaign_tag(team, id, owner);
+                    }
                     self.leave_dock(index);
                     let unit = self.units.remove(index);
                     for claim in &mut self.claims {
@@ -3192,6 +3287,7 @@ impl World {
                             *claim = 0;
                         }
                     }
+                    self.remove_stacked_claims(id);
                     if unit.stats.infantry {
                         let mut ground = Vec::new();
                         self.release_spots(&unit, &mut ground);
@@ -3299,6 +3395,7 @@ impl World {
             let cell = (x.div_euclid(LEPTONS_PER_CELL), y.div_euclid(LEPTONS_PER_CELL));
             if let Some(index) = world.map.index(cell.0, cell.1) {
                 world.spots[index] &= !(1 << spot_index(x, y));
+                if spot_index(x, y) == 0 && world.spots[index] & SPOT_BITS == 0 { world.spot_house[index] = u8::MAX; }
             }
         };
         match unit.head_to {

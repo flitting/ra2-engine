@@ -336,6 +336,7 @@ pub struct SceneCell {
 
 /// A vehicle the map places.
 pub struct UnitSpawn {
+    pub initial: Option<crate::campaign_world::InitialObject>,
     /// Model file name without extension.
     pub image: String,
     pub cell: (i32, i32),
@@ -537,6 +538,8 @@ pub struct MiningRules {
 
 /// A foot soldier the map starts with.
 pub struct InfantrySpawn {
+    pub owner: u8,
+    pub initial: Option<crate::campaign_world::InitialObject>,
     /// Index into the unit types.
     pub kind: u16,
     pub cell: (i32, i32),
@@ -548,11 +551,15 @@ pub struct InfantrySpawn {
 
 /// A building the map starts with.
 pub struct MapStructure {
+    pub owner: u8,
+    pub initial: Option<crate::campaign_world::InitialObject>,
     /// Index into the building types.
     pub kind: u16,
     pub cell: (i32, i32),
     /// 0 to 256.
     pub health: i32,
+    /// The authored turret direction, in the map's 0..255 turn units.
+    pub facing: u8,
     pub palette: Option<usize>,
 }
 
@@ -634,6 +641,10 @@ pub struct UnitArt {
     normals: NormalTables,
     base_palette: Palette,
     owner_palettes: Vec<Palette>,
+    /// Native art.ini `Palette` is a basename followed by the theatre suffix,
+    /// e.g. CANEWY04 Palette=lib uses libtem.pal rather than unittem.pal.
+    art_palette_names: HashMap<String, String>,
+    custom_palettes: HashMap<(String, Option<usize>), Option<Palette>>,
     theater_palette: Palette,
     iso_palette: Palette,
     anim_palette: Option<Palette>,
@@ -744,9 +755,8 @@ impl UnitArt {
             .or_insert_with(|| find_shape(files, art, extension, letter))
             .as_ref()?;
         let frame = shp.frames.get(frame).filter(|frame| frame.width > 0 && frame.height > 0)?;
-        let palette = palette
-            .and_then(|index| self.owner_palettes.get(index))
-            .unwrap_or(&self.base_palette);
+        let palette = techno_palette(files, self.art_palette_names.get(&art.to_ascii_lowercase()).map(String::as_str),
+            self.extension, palette, &self.owner_palettes, &self.base_palette, &mut self.custom_palettes);
         Some(BuildingSprite {
             width: frame.width as u32,
             height: frame.height as u32,
@@ -791,9 +801,8 @@ impl UnitArt {
             .or_insert_with(|| find_shape(files, art, extension, letter))
             .as_ref()?;
         let frame = shp.frames.get(frame).filter(|frame| frame.width > 0 && frame.height > 0)?;
-        let palette = palette
-            .and_then(|index| self.owner_palettes.get(index))
-            .unwrap_or(&self.base_palette);
+        let palette = techno_palette(files, self.art_palette_names.get(&art.to_ascii_lowercase()).map(String::as_str),
+            self.extension, palette, &self.owner_palettes, &self.base_palette, &mut self.custom_palettes);
         Some(BuildingSprite {
             width: frame.width as u32,
             height: frame.height as u32,
@@ -828,9 +837,8 @@ impl UnitArt {
         });
         let (vxl, hva) = model.as_ref()?;
         let light = [1000; 3];
-        let palette = palette
-            .and_then(|index| self.owner_palettes.get(index))
-            .unwrap_or(&self.base_palette);
+        let palette = techno_palette(files, self.art_palette_names.get(&image.to_ascii_lowercase()).map(String::as_str),
+            self.extension, palette, &self.owner_palettes, &self.base_palette, &mut self.custom_palettes);
         voxel::render(vxl, hva.as_ref(), self.vpl.as_ref(), &self.normals, palette, facing, light, self.hva_frame, pose)
     }
 
@@ -855,6 +863,31 @@ impl UnitArt {
         });
         model.as_ref().and_then(|(_, hva)| hva.as_ref()).map_or(1, |hva| hva.frames.len().max(1))
     }
+}
+
+fn techno_palette<'a>(
+    files: &GameFiles, basename: Option<&str>, extension: &str, owner: Option<usize>,
+    owners: &'a [Palette], base: &'a Palette,
+    cache: &'a mut HashMap<(String, Option<usize>), Option<Palette>>,
+) -> &'a Palette {
+    if let Some(basename) = basename {
+        // Native RA2 TechnoType parsing: 0x6dd960..0x6dd990; resolver
+        // 0x604567..0x604623 appends the theatre extension and '.PAL'.
+        // 0x6046bd..0x604780 constructs a colour scheme for each house.
+        let filename = format!("{basename}{extension}.pal");
+        let custom = cache.entry((filename.clone(), owner)).or_insert_with(|| {
+            let Some(mut palette) = files.get(&filename).and_then(Palette::parse) else {
+                bevy::log::warn!(filename, "custom techno palette is missing or invalid");
+                return None;
+            };
+            if let Some(owner) = owner.and_then(|index| owners.get(index)) {
+                palette.0[16..32].copy_from_slice(&owner.0[16..32]);
+            }
+            Some(palette)
+        });
+        if let Some(palette) = custom { return palette }
+    }
+    owner.and_then(|index| owners.get(index)).unwrap_or(base)
 }
 
 /// A model's name without its marks (see `UnitArt::sprite`), and the pose
@@ -1043,8 +1076,13 @@ pub struct RuleDiagnostic {
 }
 
 pub struct Scene {
+    pub radar_rules: crate::radar::EventRules,
+    pub scenario: Option<crate::campaign_world::ScenarioInit>,
+    pub scenario_objects: Vec<(crate::campaign_world::InitialObject, ra2_sim::combat::Aim)>,
     pub rule_diagnostics: Vec<RuleDiagnostic>,
     pub slave_rules: ra2_sim::slaves::Rules,
+    /// Persistent building fire types, with SHP-dependent frame bounds resolved.
+    pub damage_fire_rules: ra2_sim::building_fires::Rules,
     /// What lights the map while the game runs.
     pub light_setup: crate::lighting::LightSetup,
     /// The kinds of mark explosions leave, by art name.
@@ -1233,7 +1271,7 @@ struct ObjectRules {
 }
 
 impl ObjectRules {
-    fn load(files: &GameFiles, map: &Ini, mode: &str) -> Self {
+    fn load(files: &GameFiles, map: &Ini, mode: &str, campaign: bool) -> Self {
         // A map's own file is read over the rules, which is how maps without
         // enough water take the shipyards away (`[GAYARD] TechLevel=-1`) and
         // others change them. Sections that are lists of numbered lines in both
@@ -1244,7 +1282,10 @@ impl ObjectRules {
         if let (Some(rules), Some(mode)) = (rules.as_mut(), files.get(&mode.to_lowercase())) {
             rules.overlay(&Ini::parse(mode));
         }
-        if let Some(rules) = rules.as_mut() {
+        if let Some(rules) = rules.as_mut().filter(|_| campaign) {
+            crate::campaign_world::overlay_rules(rules, map);
+        }
+        if let Some(rules) = rules.as_mut().filter(|_| !campaign) {
             let mut types = Ini::parse(b"");
             for name in map.sections() {
                 if rules.sections().any(|section| section.eq_ignore_ascii_case(name)) && !name.ends_with("Types") {
@@ -1552,8 +1593,24 @@ pub const PLAYER_COLOURS: [&str; 8] =
     ["Gold", "DarkRed", "DarkBlue", "DarkGreen", "Orange", "DarkSky", "Purple", "Magenta"];
 
 pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
+    build_internal(files, map, player, None)
+}
+
+pub fn build_campaign(files: &GameFiles, map: &Map, player: &Player, init: crate::campaign_world::ScenarioInit) -> Option<Scene> {
+    for owner in map.units.iter().chain(&map.aircraft).map(|o| o.owner.as_str()).chain(map.infantry.iter().map(|o| o.owner.as_str())).chain(map.structures.iter().map(|o| o.owner.as_str())) {
+        init.owner(owner).ok()?;
+    }
+    let mut scene = build_internal(files, map, player, Some(&init))?;
+    scene.player_country = init.houses[init.local as usize].state.country;
+    scene.player_side = init.houses[init.local as usize].state.side;
+    scene.player_start = init.local_position();
+    scene.scenario = Some(init);
+    Some(scene)
+}
+
+fn build_internal(files: &GameFiles, map: &Map, player: &Player, scenario: Option<&crate::campaign_world::ScenarioInit>) -> Option<Scene> {
     let theater = Theater::load(files, &map.theater)?;
-    let object_rules = ObjectRules::load(files, &map.ini, &player.mode_rules);
+    let object_rules = ObjectRules::load(files, &map.ini, &player.mode_rules, scenario.is_some());
     let mut light_setup = crate::lighting::LightSetup::read(&map.ini, object_rules.rules.as_ref());
 
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
@@ -1898,9 +1955,14 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
         }
     }
     blocked.extend(structure_cells);
-    let unit_remaps: Vec<Option<usize>> = map.units.iter().map(|unit| owner_palette(&unit.owner)).collect();
-    let player_palette =
-        house_colors.palette_for_color(PLAYER_COLOURS[player.colour.min(7)], &theater.unit_palette);
+    let unit_remaps: Vec<Option<usize>> = map.units.iter().chain(&map.aircraft).map(|unit| owner_palette(&unit.owner)).collect();
+    let scenario_palettes = scenario.map(|init| init.houses.iter().map(|house| {
+        house_colors.palette_for(&house.name, map, object_rules.rules.as_ref(), &theater.unit_palette)
+    }).collect::<Vec<_>>());
+    let player_palette = match (scenario, &scenario_palettes) {
+        (Some(init), Some(palettes)) => palettes.get(init.local as usize).copied().flatten(),
+        _ => house_colors.palette_for_color(PLAYER_COLOURS[player.colour.min(7)], &theater.unit_palette),
+    };
     // Each computer player's colour: the one chosen, else the first not taken.
     // (Made here, before the palettes are handed to the art.)
     let mut taken = vec![player.colour.min(7)];
@@ -2067,7 +2129,7 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
         .as_ref()
         .map(|rules| rules.section("BuildingTypes").iter().map(|(_, name)| name.clone()).collect())
         .unwrap_or_default();
-    let armoury = std::cell::RefCell::new(object_rules.rules.as_ref().map(crate::armoury::Armoury::load).unwrap_or_default());
+    let armoury = std::cell::RefCell::new(object_rules.rules.as_ref().map(|rules| crate::armoury::Armoury::load_for_edition(rules, files.edition())).unwrap_or_default());
     let building_index = |name: &str| -> Option<u16> {
         building_names.iter().position(|n| n.eq_ignore_ascii_case(name.trim())).map(|i| i as u16)
     };
@@ -2079,8 +2141,11 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
         .unwrap_or_default();
     let country_mask = |list: &str| -> u32 {
         list.split(',')
-            .filter_map(|name| countries.iter().position(|c| c.eq_ignore_ascii_case(name.trim())))
-            .fold(0, |mask, index| mask | 1 << index.min(31))
+            .filter(|name| !name.trim().is_empty())
+            .filter_map(|name| if scenario.is_some() && name.trim().eq_ignore_ascii_case("<random>") { Some(30) } else if scenario.is_some() {
+                object_rules.rules.as_ref().and_then(|rules| crate::campaign_world::country_index(rules, name))
+            } else { countries.iter().position(|c| c.eq_ignore_ascii_case(name.trim())) })
+            .fold(0, |mask, index| mask | 1u32 << (index & 31))
     };
     let strings = files.get("ra2.csf").and_then(ra2_formats::csf::Csf::parse);
     // DATA: rules.ini `[SuperWeaponTypes]`. The keys and their defaults; `RechargeTime` is minutes, 900 frames each.
@@ -2263,6 +2328,14 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
                     reveal_to_all: yes("RevealToAll"),
                     refinery: yes("Refinery"),
                     can_be_occupied: yes("CanBeOccupied"),
+                    damage_fire_offsets: std::array::from_fn(|index| {
+                        art_key(&format!("DamageFireOffset{index}"))
+                            .and_then(|value| {
+                                let mut numbers = value.split(';').next()?.split(',').map(str::trim);
+                                Some((numbers.next()?.parse().ok()?, numbers.next()?.parse().ok()?))
+                            })
+                            .unwrap_or((0, 0))
+                    }),
                     max_occupants: number("MaxNumberOccupants").unwrap_or(0).max(0) as usize,
                     muzzles: (0..10)
                         .map_while(|i| {
@@ -2408,6 +2481,12 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
         }
         wanted_anims.borrow_mut().extend(["NUKEBALL".to_owned(), "PSIWARN".to_owned()]);
     }
+    let damage_fire_section = if files.edition() == crate::files::Edition::YuriAssets { "General" } else { "AudioVisual" };
+    let damage_fire_names: Vec<String> = object_rules.rules.as_ref()
+        .and_then(|rules| rules.get(damage_fire_section, "DamageFireTypes"))
+        .unwrap_or("").split(';').next().unwrap_or("").split(',')
+        .map(|name| name.trim().to_uppercase()).filter(|name| !name.is_empty()).collect();
+    wanted_anims.borrow_mut().extend(damage_fire_names.iter().cloned());
     wanted_anims.borrow_mut().extend(tile_anims.iter().map(|(anim, _, _)| anim.clone()));
     // And those the crates show (`[Powerups]`, the second value).
     if let Some(rules) = object_rules.rules.as_ref() {
@@ -2524,9 +2603,12 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
         .zip(&structure_palettes)
         .filter_map(|(structure, &palette)| {
             Some(MapStructure {
+                owner: scenario.map_or(NEUTRAL, |init| init.owner(&structure.owner).expect("validated structure owner")),
+                initial: scenario.map(|_| crate::campaign_world::InitialObject { section: "Structures", id: structure.id.clone(), tag: structure.tag.clone(), mission: String::new(), health: structure.health, veterancy: 0.0, group: -1 }),
                 kind: building_index(&structure.kind)?,
                 cell: (structure.x, structure.y),
                 health: structure.health,
+                facing: structure.facing,
                 palette,
             })
         })
@@ -2615,6 +2697,7 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
                     .filter(|name| !name.is_empty())
             };
             UnitSpawn {
+                initial: None,
                 owner,
                 voice_select: voice("VoiceSelect"),
                 voice_move: voice("VoiceMove"),
@@ -2999,6 +3082,8 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
         .zip(&infantry_palettes)
         .filter_map(|(soldier, &palette)| {
             Some(InfantrySpawn {
+                owner: scenario.map_or(NEUTRAL, |init| init.owner(&soldier.owner).expect("validated infantry owner")),
+                initial: scenario.map(|_| crate::campaign_world::InitialObject { section: "Infantry", id: soldier.id.clone(), tag: soldier.tag.clone(), mission: soldier.mission.clone(), health: soldier.health, veterancy: soldier.veterancy, group: soldier.group }),
                 kind: vehicle_names.iter().position(|name| name.eq_ignore_ascii_case(&soldier.kind))? as u16,
                 cell: (soldier.x, soldier.y),
                 spot: soldier.sub_cell as usize,
@@ -3038,8 +3123,15 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
     let mut unit_spawns: Vec<UnitSpawn> = map
         .units
         .iter()
+        .map(|unit| (unit, "Units"))
+        .chain(map.aircraft.iter().map(|unit| (unit, "Aircraft")))
         .zip(&unit_remaps)
-        .map(|(unit, &palette)| spawn(&unit.kind, (unit.x, unit.y), unit.facing, palette, NEUTRAL))
+        .map(|((unit, section), &palette)| {
+            let owner = scenario.map_or(NEUTRAL, |init| init.owner(&unit.owner).expect("validated unit owner"));
+            let mut made = spawn(&unit.kind, (unit.x, unit.y), unit.facing, palette, owner);
+            made.initial = scenario.map(|_| crate::campaign_world::InitialObject { section, id: unit.id.clone(), tag: unit.tag.clone(), mission: unit.mission.clone(), health: unit.health, veterancy: unit.veterancy, group: unit.group });
+            made
+        })
         .collect();
 
     // The player starts with their side's construction vehicle at a start position.
@@ -3066,7 +3158,7 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
         list.split(',').find(owned).or_else(|| list.split(',').next()).map(|name| name.trim().to_owned())
     });
     let player_side = object_rules.rules.as_ref().map_or(0, |rules| country_side(rules, player.country));
-    if let (Some(cell), Some(kind)) = (player_start, base_unit.as_deref()) {
+    if let (None, Some(cell), Some(kind)) = (scenario, player_start, base_unit.as_deref()) {
         unit_spawns.push(spawn(kind, cell, 64, player_palette, PLAYER));
     }
     // The computer houses after the human, in the order of their rows; each
@@ -3074,7 +3166,7 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
     // those taken; its base unit is the first `BaseUnit` its country owns,
     // facing north.
     let mut enemies = Vec::new();
-    if let Some(mine) = player_start {
+    if let Some(mine) = player_start.filter(|_| scenario.is_none()) {
         let starts: Vec<(i32, i32)> = (0..8)
             .filter_map(|n| map.ini.get("Waypoints", &n.to_string())?.trim().parse::<i32>().ok())
             .map(|value| (value % 1000, value / 1000))
@@ -3109,7 +3201,7 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
             enemies.push(Enemy { start, country: country as u8, side, palette, level: opponent.level });
         }
     }
-    let house_palettes: Vec<Option<usize>> = [None, player_palette].into_iter().chain(enemies.iter().map(|enemy| enemy.palette)).collect();
+    let house_palettes: Vec<Option<usize>> = scenario_palettes.unwrap_or_else(|| [None, player_palette].into_iter().chain(enemies.iter().map(|enemy| enemy.palette)).collect());
 
     // DATA: the `[AI]` and `[General]` lists a computer house plans from.
     let ai_rules = {
@@ -3184,6 +3276,11 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
             .unwrap_or_else(NormalTables::empty),
         base_palette: Palette(theater.unit_palette.0),
         owner_palettes: all_palettes,
+        art_palette_names: art_rules.iter().flat_map(|art| art.sections().filter_map(move |name| {
+            let palette = art.get(name, "Palette")?.trim();
+            (!palette.is_empty()).then(|| (name.to_ascii_lowercase(), palette.to_ascii_lowercase()))
+        })).collect(),
+        custom_palettes: HashMap::new(),
         theater_palette: Palette(theater.theater_palette.0),
         iso_palette: Palette(theater.iso_palette.0),
         anim_palette: files.get("anim.pal").and_then(Palette::parse),
@@ -3668,7 +3765,12 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
         }
     };
     // DATA: ai.ini, the computer player's triggers, teams and scripts.
-    let team_data = match (files.get("ai.ini").map(ra2_formats::ini::Ini::parse), object_rules.rules.as_ref()) {
+    let team_data = if let (Some(init), Some(rules)) = (scenario, object_rules.rules.as_ref()) {
+        crate::campaign_world::team_data(init, &map.ini, rules,
+            &|name: &str| vehicle_names.iter().position(|n| n.eq_ignore_ascii_case(name.trim())).map(|i| i as u16),
+            &|name: &str| building_index(name),
+            &|name: &str| countries.iter().position(|c| c.eq_ignore_ascii_case(name.trim())).map(|i| i as u8))
+    } else { match (files.get("ai.ini").map(ra2_formats::ini::Ini::parse), object_rules.rules.as_ref()) {
         (Some(ai), Some(rules)) => crate::aidata::load(
             &ai,
             rules,
@@ -3677,7 +3779,7 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
             &|name: &str| countries.iter().position(|c| c.eq_ignore_ascii_case(name.trim())).map(|i| i as u8),
         ),
         _ => ra2_sim::teams::Data::default(),
-    };
+    }};
     let rad_rules = object_rules.rules.as_ref().map(|rules| armoury.borrow_mut().radiation(rules)).unwrap_or_default();
     let rockets = object_rules
         .rules
@@ -3723,8 +3825,52 @@ pub fn build(files: &GameFiles, map: &Map, player: &Player) -> Option<Scene> {
     let general = |key: &str| object_rules.rules.as_ref().and_then(|rules| rules.get("General", key)).map(|v| v.split(';').next().unwrap_or("").trim().to_owned());
     let crew_escape = general("CrewEscape").and_then(|v| if v.contains('%') { v.trim_end_matches('%').parse::<f64>().ok().map(|p| p / 100.0) } else { v.parse::<f64>().ok() }).unwrap_or(0.5);
     let ship_sinking_weight = general("ShipSinkingWeight").and_then(|v| v.parse::<f64>().ok()).unwrap_or(3.0);
+    let mut diagnostics = object_rules.rules.as_ref().map(|rules| rule_diagnostics(rules, tech_level)).unwrap_or_default();
+    let mut damage_fire_rules = ra2_sim::building_fires::Rules::default();
+    {
+        let ratio = |key: &str, default| object_rules.rules.as_ref()
+            .and_then(|rules| rules.get("AudioVisual", key))
+            .and_then(|value| value.split(';').next()?.trim().trim_end_matches('%').parse::<f64>().ok())
+            .map_or(default, |value| if value > 1.0 { value / 100.0 } else { value });
+        damage_fire_rules.condition_yellow = ratio("ConditionYellow", 0.5);
+        damage_fire_rules.condition_red = ratio("ConditionRed", 0.25);
+        damage_fire_rules.enabled = true;
+        for name in &damage_fire_names {
+            let get = |key: &str| art_rules.as_ref()?.get(name, key).map(|value| value.split(';').next().unwrap_or("").trim());
+            let truth = |key: &str| get(key).is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "yes" | "true" | "1"));
+            let nonzero = |key: &str| get(key).is_some_and(|value| value.split(',').any(|part| part.trim().parse::<f64>().map_or(true, |value| value != 0.0)));
+            let unsupported = ["Normalized", "Reverse", "PingPong", "Shadow", "Scorch", "Crater", "AltPalette", "UseNormalLight", "UseCellLightConvert"].iter().any(|key| truth(key))
+                || ["Damage", "RandomRate", "RandomLoopDelay", "NumParticles"].iter().any(|key| nonzero(key))
+                || get("SpawnsParticle").is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none") && value != "-1");
+            let kind = anim_types.get(name).filter(|_| !unsupported).and_then(|anim| {
+                let images = find_shape(files, &anim.image, theater.extension, theater.letter)?.frames.len();
+                let end = anim.end.unwrap_or(images) as i32;
+                let loop_end = anim.loop_end.unwrap_or(end as usize) as i32;
+                (end > 0 && anim.delay > 0 && anim.start < end as usize && anim.loop_start < loop_end as usize && loop_end <= end).then(|| {
+                    ra2_sim::building_fires::FireType { id: name.clone(), start: anim.start as i32, loop_start: anim.loop_start as i32,
+                        loop_end, end, rate: anim.delay as i32, loop_count: anim.loop_count }
+                })
+            });
+            if let Some(kind) = kind {
+                damage_fire_rules.types.push(kind);
+            } else {
+                damage_fire_rules.enabled = false;
+                diagnostics.push(RuleDiagnostic { kind: RuleDiagnosticKind::UnsupportedBehavior, object: name.clone(),
+                    key: "DamageFireTypes".to_owned(), value: "persistent fire needs supported animation rules and valid SHP frame bounds".to_owned() });
+            }
+        }
+        if let Err(reason) = damage_fire_rules.validate() {
+            damage_fire_rules.enabled = false;
+            diagnostics.push(RuleDiagnostic { kind: RuleDiagnosticKind::UnsupportedBehavior, object: damage_fire_section.to_owned(),
+                key: "DamageFireTypes".to_owned(), value: reason });
+        }
+    }
     Some(Scene {
-        rule_diagnostics: object_rules.rules.as_ref().map(|rules| rule_diagnostics(rules, tech_level)).unwrap_or_default(),
+        radar_rules: object_rules.rules.as_ref().map(crate::radar::EventRules::read).unwrap_or_default(),
+        scenario: None,
+        scenario_objects: Vec::new(),
+        rule_diagnostics: diagnostics,
+        damage_fire_rules,
         slave_rules: {
             let number = |key: &str, default: i32| general(key).and_then(|value| value.parse::<i32>().ok()).unwrap_or(default);
             ra2_sim::slaves::Rules { short_scan: number("SlaveMinerShortScan", 8), worker_scan: number("SlaveMinerSlaveScan", 14),
@@ -3810,6 +3956,40 @@ mod edition_tests {
     use super::*;
     use crate::files::Edition;
     use ra2_sim::Order;
+
+    #[test]
+    fn original_statue_uses_its_art_palette_for_each_theatre_and_owner() {
+        let dir = crate::files::dev_dir();
+        if crate::files::find(&dir, "ra2.mix").is_none() { return }
+        for (edition, map_name) in [(Edition::RedAlert2, "all01t.map"), (Edition::RedAlert2, "all03u.map"), (Edition::YuriAssets, "all01umd.map")] {
+            if edition == Edition::YuriAssets && crate::files::find(&dir, "ra2md.mix").is_none() { continue }
+            let files = GameFiles::open_for_edition(&dir, edition).unwrap();
+            let map = Map::parse(files.get(map_name).unwrap()).unwrap();
+            let mut scene = build(&files, &map, &Player::default()).unwrap();
+            let art = &mut scene.unit_art;
+            let shape = find_shape(&files, "canewy04", art.extension, art.letter).expect("the installed Statue of Liberty SHP");
+            let frame = &shape.frames[0];
+            let palette_name = format!("lib{}.pal", art.extension);
+            let mut palette = Palette::parse(files.get(&palette_name).expect("the installed statue palette")).unwrap();
+            let expected = frame_rgba(frame, &palette, [1000; 3]);
+            let wrong = frame_rgba(frame, &art.base_palette, [1000; 3]);
+            let drawn = art.building(&files, "canewy04", 0, None, 0, false).unwrap();
+            assert_eq!(drawn.rgba, expected, "{edition:?}/{map_name} must retain original palette indices");
+            assert_ne!(drawn.rgba, wrong, "this test must catch the old unit-palette corruption");
+            if let Some(owner) = art.owner_palettes.first() {
+                palette.0[16..32].copy_from_slice(&owner.0[16..32]);
+                let expected_remapped = frame_rgba(frame, &palette, [1000; 3]);
+                let remapped = art.building(&files, "CANEWY04", 0, Some(0), 0, false).unwrap();
+                assert_eq!(remapped.rgba, expected_remapped, "only the original remap range comes from the house");
+            }
+            let shadow_index = shape.frames.len() / 2;
+            let shadow = art.building(&files, "canewy04", shadow_index, None, 0, true).unwrap();
+            assert_eq!(shadow.rgba, shadow_rgba(&shape.frames[shadow_index]));
+            let normal = find_shape(&files, "gacnst", art.extension, art.letter).unwrap();
+            let drawn_normal = art.building(&files, "gacnst", 0, None, 0, false).unwrap();
+            assert_eq!(drawn_normal.rgba, frame_rgba(&normal.frames[0], &art.base_palette, [1000; 3]), "ordinary buildings retain the native unit palette");
+        }
+    }
 
     #[test]
     fn multiplayer_country_indices_are_not_localized_or_assumed_contiguous() {

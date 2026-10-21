@@ -53,11 +53,13 @@ pub enum Depth {
 #[derive(Asset, AsBindGroup, Reflect, Clone)]
 #[bind_group_data(DepthKey)]
 pub struct DepthMaterial {
-    /// Mode, the depth shape's offset, and nothing.
+    /// Mode, the depth shape's offset, and whether palette lighting is active.
     #[uniform(20)]
     params: IVec4,
     #[texture(21, sample_type = "s_int")]
     shape: Handle<Image>,
+    #[uniform(22)]
+    light: UVec4,
     #[reflect(ignore)]
     key: DepthKey,
 }
@@ -122,15 +124,22 @@ pub struct GroundTile {
     pub source: URect,
     pub at: IVec2,
     pub base: i32,
+    pub light: crate::lighting::Lit,
 }
+
+/// The light sample for each quad, in the mesh's vertex order. Atlas entries
+/// are shared by cells at different heights and under different lamps.
+#[derive(Component)]
+pub struct GroundLighting(Vec<crate::lighting::Lit>);
 
 /// Builds the meshes that draw the ground, one for each atlas page, in the
 /// order the tiles are given.
-pub fn ground_meshes(tiles: &[GroundTile], pages: usize, page_size: u32) -> Vec<Mesh> {
+pub fn ground_meshes(tiles: &[GroundTile], pages: usize, page_size: u32) -> Vec<(Mesh, GroundLighting)> {
     use bevy::mesh::{Indices, PrimitiveTopology};
     let mut meshes = Vec::new();
     for page in 0..pages {
         let (mut positions, mut uvs, mut colours, mut indices): (Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<[f32; 4]>, Vec<u32>) = Default::default();
+        let mut lights = Vec::new();
         for tile in tiles.iter().filter(|tile| tile.page == page) {
             let first = positions.len() as u32;
             let size = tile.source.size().as_ivec2();
@@ -139,25 +148,52 @@ pub fn ground_meshes(tiles: &[GroundTile], pages: usize, page_size: u32) -> Vec<
                 positions.push([x as f32, -y as f32, 0.0]);
                 let (u, v) = (tile.source.min.x + dx as u32 * size.x as u32, tile.source.min.y + dy as u32 * size.y as u32);
                 uvs.push([u as f32 / page_size as f32, v as f32 / page_size as f32]);
-                colours.push([tile.base as f32, 0.0, 0.0, 1.0]);
+                // Red carries depth; the other channels carry Q16 RGB light.
+                colours.push([tile.base as f32, 1.0, 1.0, 1.0]);
             }
             indices.extend([first, first + 2, first + 1, first, first + 3, first + 2]);
+            lights.push(tile.light);
         }
         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
         mesh.insert_indices(Indices::U32(indices));
-        meshes.push(mesh);
+        meshes.push((mesh, GroundLighting(lights)));
     }
     meshes
+}
+
+/// Update cell lighting without changing the shared atlas or a tile's depth.
+/// This also runs when a storm or a local light changes after the map loads.
+fn apply_ground_light(
+    light: Option<Res<crate::lighting::WorldLight>>,
+    mut seen: Local<u64>,
+    ground: Query<(&Mesh2d, Ref<GroundLighting>)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    use bevy::mesh::VertexAttributeValues;
+    let Some(light) = light else { return };
+    let all = *seen != light.generation;
+    *seen = light.generation;
+    for (handle, samples) in &ground {
+        if !all && !samples.is_changed() { continue }
+        let Some(mut mesh) = meshes.get_mut(&handle.0) else { continue };
+        let Some(VertexAttributeValues::Float32x4(colours)) = mesh.attribute_mut(Mesh::ATTRIBUTE_COLOR) else { continue };
+        for (quad, sample) in colours.chunks_exact_mut(4).zip(&samples.0) {
+            let [r, g, b] = light.palette_light(sample.cell, sample.level, sample.rule).0.map(|c| c as f32);
+            for colour in quad {
+                colour[1..].copy_from_slice(&[r, g, b]);
+            }
+        }
+    }
 }
 
 /// The materials made so far, one for each mode and set of textures, and the
 /// building depth shape.
 #[derive(Resource)]
 pub struct DepthMaterials {
-    made: HashMap<(i32, bool, IVec2), Handle<DepthMaterial>>,
+    made: HashMap<(i32, bool, IVec2, Option<[u32; 3]>, bool), Handle<DepthMaterial>>,
     shape: Handle<Image>,
 }
 
@@ -195,23 +231,31 @@ fn apply_depth(
     mut commands: Commands,
     mut made: ResMut<DepthMaterials>,
     mut materials: ResMut<Assets<DepthMaterial>>,
-    changed: Query<(Entity, &Depth, Option<&SpriteMaterial<DepthMaterial>>), Changed<Depth>>,
+    changed: Query<(Entity, Ref<Depth>, Option<Ref<crate::lighting::PaletteLight>>, Option<Ref<crate::lighting::AnimationPalette>>, Option<&SpriteMaterial<DepthMaterial>>)>,
 ) {
     let made = &mut *made;
     if std::env::var_os("RA2_NODEPTH").is_some() {
         return;
     }
-    for (entity, depth, current) in &changed {
-        let (mode, value, write, at) = match depth {
+    for (entity, depth, light, animation, current) in &changed {
+        if !depth.is_changed() && !light.as_ref().is_some_and(|light| light.is_changed()) && !animation.as_ref().is_some_and(|value| value.is_changed()) && current.is_some() { continue }
+        let (mode, value, write, at) = match &*depth {
             Depth::Upright { adjust, write } => (1, *adjust, *write, IVec2::ZERO),
             Depth::Flat { adjust, write } => (2, *adjust, *write, IVec2::ZERO),
             Depth::Body { adjust, at } => (3, *adjust, true, *at),
         };
+        let light = light.map(|light| light.0);
+        let animation = animation.is_some();
         let shape = made.shape.clone();
         let handle = made
             .made
-            .entry((mode, write, at))
-            .or_insert_with(|| materials.add(DepthMaterial { params: IVec4::new(mode, at.x, at.y, 0), shape, key: DepthKey { write } }))
+            .entry((mode, write, at, light, animation))
+            .or_insert_with(|| materials.add(DepthMaterial {
+                params: IVec4::new(mode, at.x, at.y, if light.is_none() { 0 } else if animation { 2 } else { 1 }),
+                light: UVec4::from_array([light.map_or(65536, |v| v[0]), light.map_or(65536, |v| v[1]), light.map_or(65536, |v| v[2]), 0]),
+                shape,
+                key: DepthKey { write },
+            }))
             .clone();
         let mut entity = commands.entity(entity);
         entity.insert(MeshTag::new(value as u32));
@@ -230,13 +274,66 @@ impl Plugin for DepthPlugin {
         shaders.insert(GROUND_SHADER.id(), Shader::from_wesl(include_str!("ground.wesl"), "ra2/ground.wesl")).ok();
         app.add_plugins((SpriteMaterialPlugin::<DepthMaterial>::default(), Material2dPlugin::<GroundMaterial>::default()))
             .init_resource::<DepthMaterials>()
-            .add_systems(PostUpdate, apply_depth);
+            .add_systems(PostUpdate, (apply_depth, apply_ground_light));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_ground_art_keeps_cell_lighting_through_lamps_and_storms() {
+        use crate::lighting::{LightRule, LightSet, LightSetup, Lit, Source, WorldLight};
+        use bevy::mesh::VertexAttributeValues;
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>().add_systems(Update, apply_ground_light);
+        let normal = LightSet { ambient: 80, tint: [100; 3], ground: 0, level: 20 };
+        app.insert_resource(WorldLight::new(LightSetup {
+            normal,
+            ion: LightSet { ambient: 40, ..normal },
+            change_frames: 1,
+            change_step: 100,
+            ..default()
+        }));
+        let tiles: Vec<_> = [((1, 1), 0, -50), ((20, 20), 2, -900)].into_iter().map(|(cell, level, base)| GroundTile {
+            page: 0,
+            source: URect::new(0, 0, 60, 30),
+            at: IVec2::ZERO,
+            base,
+            light: Lit { cell, level, rule: LightRule::Ground { raise: 0 } },
+        }).collect();
+        let (mesh, samples) = ground_meshes(&tiles, 1, 2048).pop().unwrap();
+        let handle = app.world_mut().resource_mut::<Assets<Mesh>>().add(mesh);
+        app.world_mut().spawn((Mesh2d(handle.clone()), samples));
+        let colours = |app: &App| {
+            let mesh = app.world().resource::<Assets<Mesh>>().get(&handle).unwrap();
+            let Some(VertexAttributeValues::Float32x4(values)) = mesh.attribute(Mesh::ATTRIBUTE_COLOR) else { panic!("ground colours") };
+            values.clone()
+        };
+        app.update();
+        let before = colours(&app);
+        assert!(0.0 < before[0][1] && before[0][1] < before[4][1] && before[4][1] < 65536.0);
+        app.world_mut().resource_mut::<WorldLight>().set_sources(vec![Source {
+            x: 384, y: 384, radius: 256, intensity: 100, tint: [0; 3],
+        }]);
+        app.update();
+        let lamp = colours(&app);
+        assert!(lamp[0][1] > before[0][1]);
+        assert_eq!(lamp[4], before[4], "a lamp must not brighten the other cell sharing its art");
+        {
+            let mut light = app.world_mut().resource_mut::<WorldLight>();
+            light.set_storm(true, 10);
+            light.step(10);
+        }
+        app.update();
+        let storm = colours(&app);
+        for (i, colour) in storm.iter().enumerate() {
+            assert_eq!(colour[0], if i < 4 { -50.0 } else { -900.0 }, "lighting must preserve fragment depth");
+            assert!(colour[1] < before[i][1]);
+            assert_eq!(colour[1..], storm[i / 4 * 4][1..], "no light gradient inside one tile");
+        }
+    }
 
     #[test]
     fn the_building_depth_shape_is_nearest_up_its_middle() {

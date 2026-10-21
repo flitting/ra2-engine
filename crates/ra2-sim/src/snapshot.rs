@@ -16,8 +16,9 @@
 //!
 //! | `World`   | fields |
 //! |-----------|--------|
-//! | State     | `random` `idle_random` `tick` `next_id` `over`; `houses`; `units` `landing_orders` `unpacked`; `buildings`; `claims` `spots` `spot_house`; `bullets` `events` `dying` `bombs` `pending_bites` `leaps` `waves` `rad_sites` `storm` `nukes` `animated` `wreckage`; `teams`; `ore_queues` `ore_ready`; `trigger_scores`; `map` (below) |
+//! | State     | `random` `idle_random` `tick` `next_id` `over`; `houses`; `units` `landing_orders` `unpacked`; `buildings`; `claims` `stacked_claims` `spots` `spot_house`; `bullets` `events` `dying` `bombs` `pending_bites` `leaps` `waves` `rad_sites` `storm` `nukes` `animated` `wreckage`; `teams`; `ore_queues` `ore_ready`; `trigger_scores`; `mission_state`; `map` (below) |
 //! | Rules     | `end_checks` `short_game` `supers_allowed` `bridges_destroyable` `bridge_strength` `tracks` `blockage_delay` `path_delay` `close_enough` `building_types` `unit_types` `queue_limit` `build_rules` `mcv_repacks` `buildup_ticks` `chrono` `refund_percent` `repair_step` `repair_percent` `repair_interval` `survivor_divisors` `crew_types` `remains_rules` `weapons` `warheads` `projectiles` `gravity` `max_damage` `missile_rot_var` `targeting_delay` `condition_red` `c4_delay` `ai_rules` `team_data` `rockets` `super_types` `super_rules` `veterancy` `rad_rules` `ability_rules` `reload_delay` `ore_values` `ore_near_scan` `ore_far_scan` `harvester_load_rate` `harvester_dump_rate` `harvester_too_far` `chrono_too_far` `ore_types` `idle_frequency` |
+//! | Campaign rules | `mission_data`, including a rules fingerprint checked on restore |
 //! | Derived   | none |
 //!
 //! | `Map`     | fields |
@@ -45,7 +46,7 @@ use crate::{Map, World};
 
 /// Goes up whenever a state type or the layout changes; a snapshot of another
 /// number is refused.
-pub const FORMAT: u32 = 7;
+pub const FORMAT: u32 = 20;
 
 type Sections = Vec<(&'static str, Vec<u8>)>;
 
@@ -80,16 +81,17 @@ macro_rules! classify {
 
 classify! { World, write_world, read_world,
     state {
-        "clock": random idle_random tick next_id over;
+        "clock": random idle_random campaign_random tick next_id over;
         "houses": houses;
         "units": units landing_orders unpacked;
         "buildings": buildings;
-        "cells": claims spots spot_house;
+        "cells": claims stacked_claims spots spot_house;
         "transient": bullets events dying bombs pending_bites leaps waves pending_marks rad_sites storm nukes animated wreckage;
         "teams": teams trigger_scores;
         "crates": crates crates_on;
         "ore queues": ore_queues ore_ready;
         "slave miners": slave_pools;
+        "mission": mission_state;
     }
     other {
         // State, by the table below.
@@ -99,12 +101,13 @@ classify! { World, write_world, read_world,
         blockage_delay path_delay close_enough sight_height_step building_types unit_types queue_limit
         build_rules mcv_repacks buildup_ticks chrono refund_percent repair_step
         repair_percent repair_interval survivor_divisors crew_types third_survivor_divisor third_crew weapons warheads
-        projectiles gravity ballistic_scatter elevation max_damage missile_rot_var targeting_delay condition_red
+        projectiles gravity ballistic_scatter elevation max_damage missile_rot_var targeting_delay condition_red damage_fire_rules
         idle_frequency c4_delay ai_rules team_data rockets super_types super_rules crate_rules veterancy rad_rules
         ability_rules reload_delay ore_values ore_near_scan ore_far_scan
         harvester_load_rate harvester_dump_rate harvester_too_far chrono_too_far ore_types
         slave_rules
         anim_marks splash_anims remains_rules
+        mission_data
     }
 }
 
@@ -139,7 +142,7 @@ fn fnv(bytes: &[u8]) -> u64 {
 
 impl World {
     fn sections(&self) -> Sections {
-        let mut sections = Vec::new();
+        let mut sections = vec![("damage fire rules", self.damage_fire_rules_fingerprint().to_le_bytes().to_vec())];
         write_world(self, &mut sections);
         write_map(&self.map, &mut sections);
         sections
@@ -181,7 +184,16 @@ impl World {
             rest = &rest[8 + length..];
         }
         let mut sections = sections.into_iter();
+        // Immutable animation/SHP metadata changes both random requests and
+        // future frames. Check it for every mode, before replacing any state.
+        let fire_rules: [u8; 8] = sections.next().ok_or("missing damage fire rules fingerprint")?
+            .try_into().map_err(|_| "invalid damage fire rules fingerprint")?;
+        if u64::from_le_bytes(fire_rules) != self.damage_fire_rules_fingerprint() {
+            return Err("snapshot damage fire rules differ from this world's rules".into());
+        }
         read_world(self, &mut sections)?;
+        self.validate_building_damage_fires()?;
+        self.validate_mission_state()?;
         read_map(&mut self.map, &mut sections)?;
         if sections.next().is_some() {
             return Err("sections left over".into());

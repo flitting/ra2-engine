@@ -63,6 +63,7 @@ impl World {
                 continue;
             }
             let human = self.human(unit.owner);
+            let scatters = self.unit_mission_scatters(unit.id);
             let fighter = unit.stats.fighter;
             let unit = &mut self.units[index];
             if unit.fear > 0 && !fighter.fearless {
@@ -86,7 +87,7 @@ impl World {
             if moving || unit.arms.firing > 0 || unit.prone || dug_in {
                 unit.fidget = None;
             }
-            if fighter.fraidycat && unit.fear > PRONE_FEAR && idle {
+            if fighter.fraidycat && unit.fear > PRONE_FEAR && idle && scatters {
                 let id = unit.id;
                 self.scatter_unit_from(id, Scatter::Nearest);
                 continue;

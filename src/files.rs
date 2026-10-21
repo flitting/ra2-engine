@@ -16,7 +16,7 @@ const ARCHIVES: &[&str] = &[
 
 /// Selects the original rules, art, maps and interface. Expansion-specific
 /// simulation behavior is implemented separately, and remains incomplete.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Edition {
     #[default]
     RedAlert2,
@@ -66,6 +66,9 @@ const MD_ALIASES: &[(&str, &str)] = &[
     ("theme.ini", "thememd.ini"),
     ("ra2.csf", "ra2md.csf"),
     ("missions.pkt", "missionsmd.pkt"),
+    ("battle.ini", "battlemd.ini"),
+    ("mission.ini", "missionmd.ini"),
+    ("mapsel.ini", "mapselmd.ini"),
     ("mpmodes.ini", "mpmodesmd.ini"),
     // The direct-to-game debug entry point defaults to MPBattle.ini.
     ("mpbattle.ini", "mpbattlemd.ini"),
@@ -118,6 +121,10 @@ pub struct GameFiles {
     sidebars: Vec<Option<Mix>>,
     sidebar_overlays: Vec<Option<Mix>>,
     side: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Campaign films are opened on demand and are optional. Their names are
+    /// reused between editions, so the expansion must never fall through to
+    /// the base game's movie archives.
+    movies: std::sync::Arc<std::sync::OnceLock<Vec<Mix>>>,
 }
 
 /// Finds a file in `dir` ignoring case, since the depot mixes upper and lower case.
@@ -154,9 +161,11 @@ impl GameFiles {
         };
         let (base, sidebars) = Self::read_archives(&dir, ARCHIVES, NESTED, SIDEBARS)?;
         archives.extend(base);
-        let files = Self { dir, edition, archives, sidebars, sidebar_overlays, side: Default::default() };
+        let files = Self { dir, edition, archives, sidebars, sidebar_overlays, side: Default::default(), movies: Default::default() };
         if edition == Edition::YuriAssets {
-            let missing: Vec<_> = MD_ALIASES.iter().filter(|(base, _)| files.get(base).is_none()).map(|(_, md)| *md).collect();
+            // Campaign metadata is checked only on the campaign path; adding
+            // it must not make a skirmish-only installation fail validation.
+            let missing: Vec<_> = MD_ALIASES.iter().filter(|(base, _)| !matches!(*base, "battle.ini" | "mission.ini" | "mapsel.ini") && files.get(base).is_none()).map(|(_, md)| *md).collect();
             if !missing.is_empty() {
                 return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("experimental YR assets are incomplete: {}", missing.join(", "))));
             }
@@ -220,6 +229,19 @@ impl GameFiles {
         let sidebar = |at: usize| self.sidebars.get(at).and_then(Option::as_ref).and_then(|mix| mix.get(name));
         let overlay = |at: usize| self.sidebar_overlays.get(at).and_then(Option::as_ref).and_then(|mix| mix.get(name));
         overlay(side).or_else(|| sidebar(shared)).or_else(|| sidebar(0)).or_else(|| self.archives.iter().find_map(|mix| mix.get(name)))
+    }
+
+    /// A named campaign film from this edition's movie bank. The base game's
+    /// A01_F00E and the expansion's A01_F00E are different films.
+    pub fn movie(&self, name: &str) -> Option<&[u8]> {
+        let archives = self.movies.get_or_init(|| {
+            let names: &[&str] = match self.edition {
+                Edition::RedAlert2 => &["movies01.mix", "movies02.mix"],
+                Edition::YuriAssets => &["movmd03.mix"],
+            };
+            names.iter().filter_map(|name| find(&self.dir, name).and_then(|path| Mix::open(path).ok())).collect()
+        });
+        archives.iter().find_map(|mix| mix.get(name))
     }
 
     /// YR's audio bank adds samples to the original bank. Each index must be
@@ -525,6 +547,30 @@ mod tests {
         let error = GameFiles::open_for_edition(&dir.0, Edition::YuriAssets).err().expect("a missing YR archive must fail");
         assert!(error.to_string().contains("langmd.mix"));
         assert!(GameFiles::open_for_edition(&dir.0, Edition::RedAlert2).is_ok());
+    }
+
+    #[test]
+    fn campaign_aliases_do_not_make_campaign_files_mandatory_for_skirmish() {
+        let dir = TestDir::new();
+        edition_fixture(&dir.0, Some("missionmd.ini"));
+        write_mix(&dir.0.join("ra2.mix"), &[("rules.ini", b"base rules"), ("art.ini", b"base art"), ("mission.ini", b"base campaign")]);
+        let yr = GameFiles::open_for_edition(&dir.0, Edition::YuriAssets).unwrap();
+        assert!(yr.get("mission.ini").is_none(), "YR must not read the base mission INI when its own metadata is absent");
+        assert_eq!(yr.get("battle.ini"), yr.get("battlemd.ini"));
+        assert_eq!(yr.get("mapsel.ini"), yr.get("mapselmd.ini"));
+    }
+
+    #[test]
+    fn campaign_movie_names_are_scoped_to_the_selected_edition() {
+        let dir = TestDir::new();
+        edition_fixture(&dir.0, None);
+        write_mix(&dir.0.join("movies01.mix"), &[("A01_F00e.bik", b"RA2 first mission"), ("base_only.bik", b"RA2 only")]);
+        write_mix(&dir.0.join("movmd03.mix"), &[("A01_F00e.bik", b"YR first mission")]);
+        let base = GameFiles::open_for_edition(&dir.0, Edition::RedAlert2).unwrap();
+        let yr = GameFiles::open_for_edition(&dir.0, Edition::YuriAssets).unwrap();
+        assert_eq!(base.movie("a01_f00e.bik"), Some(b"RA2 first mission".as_slice()));
+        assert_eq!(yr.movie("a01_f00e.bik"), Some(b"YR first mission".as_slice()));
+        assert!(yr.movie("base_only.bik").is_none());
     }
 
     #[test]

@@ -119,12 +119,11 @@ pub struct RadarPlugin;
 
 impl Plugin for RadarPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<RadarEvents>().add_systems(OnEnter(Screen::InGame), |mut commands: Commands, mut events: ResMut<RadarEvents>| {
+        app.init_resource::<RadarEvents>().add_systems(OnEnter(Screen::InGame), |mut commands: Commands| {
             commands.insert_resource(Radar::default());
-            events.0.clear();
         }).add_systems(
             Update,
-            update
+            (animate_events, update).chain().in_set(RadarPresentationSet).after(crate::campaign::CampaignPresentationSet)
                 .run_if(in_state(Screen::InGame))
                 .run_if(crate::pause::playing)
                 .run_if(resource_exists::<Radar>)
@@ -135,10 +134,56 @@ impl Plugin for RadarPlugin {
     }
 }
 
+#[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RadarPresentationSet;
+
+pub(crate) const EVENT_TYPES: usize = 17;
+
+/// RA2 0x7a8d58 / YR 0x7f0998. The first six entries are overridden by
+/// the shipped General lists; the remaining entries retain these defaults.
+#[derive(Clone, Debug)]
+pub(crate) struct EventRules {
+    suppression: [i32; EVENT_TYPES],
+    visible: [u64; EVENT_TYPES],
+    duration: [u64; EVENT_TYPES],
+    radius: f32,
+    speed: f32,
+    rotation: f32,
+    colour_speed: f32,
+}
+
+impl Default for EventRules {
+    fn default() -> Self {
+        Self {
+            suppression: [8, 8, 8, 8, 8, 6, 2, 8, 2, 5, 8, 8, 8, 8, 8, 8, 8],
+            visible: [200, 200, 200, 200, 200, 200, 0, 0, 0, 0, 0, 200, 200, 0, 0, 0, 200],
+            duration: [400, 400, 400, 600, 400, 400, 200, 200, 400, 400, 100, 200, 400, 5, 200, 400, 600],
+            radius: 8.0, speed: 1.2, rotation: 0.05, colour_speed: 0.1,
+        }
+    }
+}
+
+impl EventRules {
+    pub(crate) fn read(rules: &ra2_formats::ini::Ini) -> Self {
+        let mut value = Self::default();
+        let get = |key| rules.get("General", key).map(|s| s.split(';').next().unwrap_or("").trim());
+        if let Some(list) = get("RadarEventSuppressionDistances") { for (slot, text) in value.suppression.iter_mut().zip(list.split(',')) { if let Ok(number) = text.trim().parse() { *slot = number; } } }
+        for (key, dest) in [("RadarEventVisibilityDurations", &mut value.visible), ("RadarEventDurations", &mut value.duration)] {
+            if let Some(list) = get(key) { for (slot, text) in dest.iter_mut().zip(list.split(',')) { if let Ok(number) = text.trim().parse() { *slot = number; } } }
+        }
+        if let Some(number) = get("RadarEventMinRadius").and_then(|text| text.parse::<i32>().ok()) { value.radius = number as f32; }
+        for (key, dest) in [("RadarEventSpeed", &mut value.speed), ("RadarEventRotationSpeed", &mut value.rotation), ("RadarEventColorSpeed", &mut value.colour_speed)] {
+            if let Some(number) = get(key).and_then(|text| text.parse::<f32>().ok()).filter(|n| n.is_finite()) { *dest = number; }
+        }
+        value
+    }
+}
+
 /// Scales the raw picture of the ground down by averaging.
 // An area average; each raw pixel under a picture
 // pixel counts by how much of it lies inside.
 /// A ping on the radar: its type, cell, and the turning square that closes on it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RadarEvent {
     kind: usize,
     cell: (i32, i32),
@@ -151,21 +196,25 @@ pub struct RadarEvent {
     /// The ticks it stops being drawn and stops holding off others like it.
     shown_until: u64,
     expires: u64,
+    colour: f32,
+    colour_step: f32,
+    last_tick: u64,
+    visible: bool,
 }
 
 /// The pings alive.
 #[derive(Resource, Default)]
-pub struct RadarEvents(pub Vec<RadarEvent>);
+pub struct RadarEvents(pub Vec<RadarEvent>, pub(crate) EventRules);
 
 /// Per type: how near a like event holds a new one off (cells), frames shown,
 /// frames alive, and its colour (none: never drawn).
 // Base attacked is type 3, an ally's 16.
-fn event_type(kind: usize) -> (i32, u64, u64, Option<[u8; 3]>) {
+fn event_colour(kind: usize) -> Option<[u8; 3]> {
     match kind {
-        3 => (8, 200, 600, Some([255, 0, 255])),
-        4 => (8, 200, 400, Some([255, 0, 255])),
-        12 => (8, 200, 400, Some([255, 255, 0])),
-        _ => (8, 0, 400, None),
+        0 | 3 | 4 => Some([255, 0, 255]),
+        1 | 2 | 11 | 12 => Some([255, 255, 0]),
+        5 => Some([0, 255, 255]),
+        _ => None,
     }
 }
 
@@ -173,16 +222,82 @@ impl RadarEvents {
     /// Starts an event unless one of its type is alive within its distance.
     /// Returns whether it was started.
     pub fn raise(&mut self, kind: usize, cell: (i32, i32), tick: u64) -> bool {
+        if kind >= EVENT_TYPES { return false }
         self.0.retain(|event| event.animating || tick < event.expires);
-        let (distance, ..) = event_type(kind);
-        let near = |event: &RadarEvent| (((event.cell.0 - cell.0) as f32).hypot((event.cell.1 - cell.1) as f32) as i32) < distance;
-        if self.0.iter().any(|event| event.kind == kind && near(event)) {
+        // CellStruct differences wrap as i16 before the native x87 sqrt;
+        // the converted distance is truncated and sign extended from i16.
+        let near = |event: &RadarEvent| {
+            let dx = (cell.0 as i16).wrapping_sub(event.cell.0 as i16) as f64;
+            let dy = (cell.1 as i16).wrapping_sub(event.cell.1 as i16) as f64;
+            ((dx * dx + dy * dy).sqrt() as i32 as i16 as i32) < self.1.suppression[kind]
+        };
+        let suppress = matches!(kind, 0 | 3..=8 | 11 | 14..=16);
+        if suppress && self.0.iter().any(|event| event.kind == kind && near(event)) {
             return false;
         }
         // DATA: `RadarEventRotationSpeed` (.05).
-        self.0.push(RadarEvent { kind, cell, radius: None, angle: std::f32::consts::FRAC_PI_4, rotation: 0.05, animating: true, shown_until: 0, expires: 0 });
+        self.0.push(RadarEvent { kind, cell, radius: None, angle: std::f32::consts::FRAC_PI_4, rotation: self.1.rotation, animating: true, shown_until: 0, expires: 0, colour: 0.0, colour_step: self.1.colour_speed, last_tick: tick, visible: true });
         true
     }
+}
+
+impl RadarEvent {
+    fn advance(&mut self, tick: u64, rules: &EventRules) {
+        if tick <= self.last_tick { return }
+        for frame in self.last_tick + 1..=tick {
+            if !self.visible { break }
+            if !self.animating && frame >= self.shown_until { self.visible = false; }
+            let Some(radius) = self.radius.as_mut() else { break };
+            *radius = native_float((f64::from(*radius) - f64::from(rules.speed)).max(f64::from(rules.radius)));
+            let past = {
+                let angle = f64::from(self.angle) + std::f64::consts::FRAC_PI_4;
+                native_float(angle - (angle * std::f64::consts::FRAC_2_PI).trunc() * std::f64::consts::FRAC_PI_2)
+            };
+            if self.animating {
+                if (*radius - rules.radius).abs() < 0.01 {
+                    if past < self.rotation {
+                        self.angle = native_float(f64::from(self.angle) + f64::from(past));
+                        self.animating = false;
+                        self.shown_until = frame + rules.visible[self.kind];
+                        self.expires = frame + rules.duration[self.kind];
+                    } else {
+                        self.angle = native_float(f64::from(self.angle) + f64::from(self.rotation));
+                        self.rotation = native_float((f64::from(self.rotation) - f64::from(rules.rotation) * f64::from(0.02f32))
+                            .max(f64::from(rules.rotation) * f64::from(0.33333334f32)));
+                    }
+                } else { self.angle = native_float(f64::from(self.angle) + f64::from(self.rotation)); }
+            }
+            if f64::from(self.angle) > std::f64::consts::TAU { self.angle = native_float(f64::from(self.angle) - std::f64::consts::TAU); }
+            let colour = f64::from(self.colour) + f64::from(self.colour_step);
+            self.colour = native_float(colour);
+            if colour < 0.0 && self.colour_step < 0.0 { self.colour = 0.0; self.colour_step = -self.colour_step; }
+            else if colour > 1.0 && self.colour_step > 0.0 { self.colour = 1.0; self.colour_step = -self.colour_step; }
+        }
+        self.last_tick = tick;
+    }
+}
+
+/// The original x87 control word 0xe7f truncates float stores. Rust's ordinary
+/// f64-to-f32 conversion rounds to nearest, which drifts animation phases.
+fn native_float(value: f64) -> f32 {
+    let rounded = value as f32;
+    if rounded.is_finite() && ((value > 0.0 && f64::from(rounded) > value) || (value < 0.0 && f64::from(rounded) < value)) {
+        f32::from_bits(rounded.to_bits() - 1)
+    } else { rounded }
+}
+
+fn animate_events(sim: Res<Sim>, mut events: ResMut<RadarEvents>) {
+    let Some(layout) = Layout::new(&sim.0) else { return };
+    let tick = sim.0.current_tick();
+    let rules = events.1.clone();
+    for event in &mut events.0 {
+        if event.radius.is_none() {
+            let (px, py) = layout.point(event.cell.0 * LEPTONS_PER_CELL + 128, event.cell.1 * LEPTONS_PER_CELL + 128);
+            event.radius = Some(px.max(py).max(layout.size.0 - px).max(layout.size.1 - py) as f32);
+        }
+        event.advance(tick, &rules);
+    }
+    events.0.retain(|event| event.animating || tick < event.expires);
 }
 
 fn scale_ground(layout: &Layout, raw: &[[u8; 3]]) -> Vec<[u8; 3]> {
@@ -237,7 +352,7 @@ fn foundation_pixels(scale: f32, (w, h): (i32, i32)) -> Vec<(i32, i32)> {
 #[allow(clippy::too_many_arguments)]
 fn update(
     mut radar: ResMut<Radar>,
-    mut sim: ResMut<Sim>,
+    sim: Res<Sim>,
     view: Res<UnitView>,
     ground: Res<RadarGround>,
     files: Res<GameFiles>,
@@ -245,7 +360,7 @@ fn update(
     centre: Res<ViewCentre>,
     pointer: Res<Pointer>,
     buttons: Res<ButtonInput<MouseButton>>,
-    picking: (Res<Selection>, Res<crate::control::Mode>, ResMut<crate::control::RadarOver>, ResMut<RadarEvents>, Query<(), Added<RadarArt>>),
+    picking: (Res<Selection>, Res<crate::control::Mode>, ResMut<crate::control::RadarOver>, Res<RadarEvents>, Query<(), Added<RadarArt>>),
     window: Single<&Window, With<PrimaryWindow>>,
     mut images: ResMut<Assets<Image>>,
     mut centre_on: ResMut<CentreOn>,
@@ -254,7 +369,8 @@ fn update(
     mut map: Single<(&mut ImageNode, &mut Node, &mut Visibility), (With<RadarMap>, Without<RadarArt>)>,
 ) {
     let radar = &mut *radar;
-    let (selection, modes, mut radar_over, mut events, fresh) = picking;
+    let (selection, modes, mut radar_over, events, fresh) = picking;
+    if sim.0.mission_input_locked() { radar_over.0 = None; radar.pressed = false; }
     // A sidebar laid out again (the window changed size) starts with blank
     // pictures: draw everything afresh.
     if !fresh.is_empty() {
@@ -353,7 +469,7 @@ fn update(
     // pixel wider all round.
     let (pw, ph) = (ow + 2, oh + 2);
     let mut rgba = vec![0u8; (pw * ph * 4) as usize];
-    let mut put = |rgba: &mut [u8], x: i32, y: i32, colour: [u8; 3]| {
+    let put = |rgba: &mut [u8], x: i32, y: i32, colour: [u8; 3]| {
         if (0..ow).contains(&x) && (0..oh).contains(&y) {
             let at = (((y + 1) * pw + x + 1) * 4) as usize;
             rgba[at..at + 4].copy_from_slice(&[colour[0], colour[1], colour[2], 255]);
@@ -381,40 +497,18 @@ fn update(
             put(&mut rgba, x, y, view.radar_colour_unit(unit.id, unit.owner));
         }
     }
-    // Each ping's square shrinks by
-    // `RadarEventSpeed` a pass from the picture's edge to `RadarEventMinRadius`,
-    // turning; at the smallest it slows and stops square to the picture, and is
-    // shown for its type's frames more.
-    // DATA: `RadarEventSpeed` 1.2, `RadarEventMinRadius` 8.
+    // Logic advances these even with a closed radar; rendering never advances
+    // the timer or changes a saved event's animation phase.
     {
-        let tick = world.current_tick();
-        for event in &mut events.0 {
-            let (_, visible, duration, colour) = event_type(event.kind);
+        for event in &events.0 {
             let (px, py) = layout.point(event.cell.0 * LEPTONS_PER_CELL + 128, event.cell.1 * LEPTONS_PER_CELL + 128);
-            let radius = event.radius.get_or_insert_with(|| px.max(py).max(ow - px).max(oh - py) as f32);
-            *radius = (*radius - 1.2).max(8.0);
-            if event.animating {
-                if (*radius - 8.0).abs() < 0.01 {
-                    let quarter = std::f32::consts::FRAC_PI_2;
-                    let past = (event.angle + quarter / 2.0) % quarter;
-                    if past < event.rotation {
-                        event.angle += past;
-                        event.animating = false;
-                        event.shown_until = tick + visible;
-                        event.expires = tick + duration;
-                    } else {
-                        event.angle += event.rotation;
-                        event.rotation = (event.rotation - 0.001).max(0.05 / 3.0);
-                    }
-                } else {
-                    event.angle += event.rotation;
-                }
-            }
-            let Some(colour) = colour.filter(|_| event.animating || tick < event.shown_until) else {
+            let Some(radius) = event.radius else { continue };
+            let Some(colour) = event_colour(event.kind).filter(|_| event.visible) else {
                 continue;
             };
+            let colour = colour.map(|channel| (f32::from(channel) * (0.5 + event.colour * 0.5)) as u8);
             let (sin, cos) = event.angle.sin_cos();
-            let (x, y) = ((cos * *radius) as i32, (sin * *radius) as i32);
+            let (x, y) = ((cos * radius) as i32, (sin * radius) as i32);
             let corners = [(x, y), (-y, x), (-x, -y), (y, -x)].map(|(dx, dy)| (px + dx, py + dy));
             for i in 0..4 {
                 let (from, to) = (corners[i], corners[(i + 1) % 4]);
@@ -444,7 +538,7 @@ fn update(
         box_y = oh - box_h - 1;
     }
     let line = crate::hud::TEXT;
-    let mut outline = |rgba: &mut [u8], x0: i32, y0: i32, w: i32, h: i32, inner: bool| {
+    let outline = |rgba: &mut [u8], x0: i32, y0: i32, w: i32, h: i32, inner: bool| {
         let mut dot = |x: i32, y: i32| {
             if inner {
                 put(rgba, x, y, line);
@@ -491,7 +585,7 @@ fn update(
     // A right press centres the view on the cell; so
     // does a left press, unless the selection has an order to give there, which
     // is then given when the button is let go. Holding and dragging does nothing.
-    let over = pointer.0.and_then(|at| {
+    let over = (!world.mission_input_locked()).then_some(pointer.0).flatten().and_then(|at| {
         let x = (at.x - (window.width() - SIDEBAR_WIDTH)) as i32 - layout.at.0;
         let y = (at.y - (crate::hud::CREDITS_HEIGHT - 16.0)) as i32 - layout.at.1;
         ((0..ow).contains(&x) && (0..oh).contains(&y)).then(|| layout.cell_at((x, y)))
@@ -513,4 +607,73 @@ fn update(
         go(&mut centre_on);
     }
     let _ = units;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_suppression_exceptions_and_partial_rules_lists_are_preserved() {
+        let rules = EventRules::read(&ra2_formats::ini::Ini::parse(b"[General]\nRadarEventDurations=400,400,400,400,400,400\nRadarEventSuppressionDistances=8,8,8,8,8,6\n"));
+        assert_eq!(rules.duration[3], 400);
+        assert_eq!((rules.duration[13], rules.duration[16]), (5, 600));
+        let mut events = RadarEvents(Vec::new(), rules);
+        assert!(events.raise(3, (20, 20), 0));
+        assert!(!events.raise(3, (27, 23), 0));
+        assert!(events.raise(3, (28, 20), 0));
+        for kind in [1, 2, 9, 10, 12, 13] {
+            assert!(events.raise(kind, (20, 20), 0));
+            assert!(events.raise(kind, (20, 20), 0), "native kind {kind} has no suppression gate");
+        }
+        assert!(!events.raise(EVENT_TYPES, (20, 20), 0));
+    }
+
+    #[test]
+    fn saved_radar_phase_continues_by_logic_tick_independently_of_draws() {
+        let mut events = RadarEvents::default();
+        assert!(events.raise(3, (20, 20), 10));
+        events.0[0].radius = Some(110.0);
+        events.0[0].advance(75, &events.1);
+        let state = bincode::serialize(&events.0).unwrap();
+        let mut restored: Vec<RadarEvent> = bincode::deserialize(&state).unwrap();
+        events.0[0].advance(220, &events.1);
+        for tick in 76..=220 { restored[0].advance(tick, &events.1); }
+        assert_eq!(restored, events.0);
+        let stopped = restored.clone();
+        restored[0].advance(220, &events.1);
+        assert_eq!(restored, stopped, "another draw at the same logic tick changes nothing");
+    }
+
+    /// Captured by sibling native/radar/probe.py from the user's installed
+    /// original bytes. Requires that explicit native research artifact.
+    #[test]
+    #[ignore]
+    fn captured_original_radar_update_matches_both_editions() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("ra2-campaign-research/native/radar");
+        for binary in ["game.exe", "gamemd.exe"] {
+            let raw = std::fs::read(root.join(binary).join("results.bin")).expect("run native/radar/probe.py first");
+            let mut cursor = 0;
+            for (minimum, speed, rotation, colour_speed) in [(8.0, 1.2, 0.05, 0.1), (6.0, 2.7, 0.123, 0.17)] {
+                let mut rules = EventRules { radius: minimum, speed, rotation, colour_speed, ..Default::default() };
+                rules.duration[..6].fill(400);
+                for kind in [0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16] {
+                    for radius in [8.0, 9.2, 30.0, 110.0] {
+                        let mut events = RadarEvents(Vec::new(), rules.clone());
+                        events.raise(kind, (20, 20), 0);
+                        let event = &mut events.0[0];
+                        event.radius = Some(radius);
+                        for tick in [1, 2, 3, 10, 20, 30, 60, 90, 100, 120, 180, 200, 250, 300, 450, 650] {
+                            event.advance(tick, &rules);
+                            let actual = [event.radius.unwrap().to_bits(), event.angle.to_bits(), event.rotation.to_bits(), event.colour.to_bits(), event.colour_step.to_bits(), u32::from(event.animating), u32::from(event.visible), event.shown_until as u32, event.expires as u32];
+                            let expected: Vec<u32> = raw[cursor..cursor + 36].chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap())).collect();
+                            assert_eq!(actual.as_slice(), expected, "{binary} kind={kind} radius={radius} minimum={minimum} tick={tick}");
+                            cursor += 36;
+                        }
+                    }
+                }
+            }
+            assert_eq!(cursor, raw.len());
+        }
+    }
 }

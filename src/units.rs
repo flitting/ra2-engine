@@ -299,9 +299,9 @@ struct UnitShadow(u32);
 type ShadowKey = (String, u8);
 
 /// One of the sprites a building is drawn from: the building's id, which of its
-/// parts this is, and what it is showing.
+/// parts this is, what it is showing, and whether its draw adds ExtraLight.
 #[derive(Component)]
-struct BuildingSprite(u32, usize, Option<PartKey>);
+struct BuildingSprite(u32, usize, Option<PartKey>, bool);
 
 pub struct UnitsPlugin;
 
@@ -370,7 +370,7 @@ impl Plugin for UnitsPlugin {
             )
             .add_systems(
                 Update,
-                (auto_build, announce, rock_units, show_units, show_buildings, show_walls, show_crates, show_mirages, show_bridges, show_ore, show_effects, show_markers, show_corpses, show_debris, show_sinking, show_sparks, light_world, light_units, crate::lighting::apply)
+                (auto_build, announce, rock_units, show_units, show_buildings, show_damage_fires, show_walls, show_crates, show_mirages, show_bridges, show_ore, show_effects, show_markers, show_corpses, show_debris, show_sinking, show_sparks, light_world, light_units, crate::lighting::apply)
                     .chain()
                     .run_if(in_state(Screen::InGame))
                     .run_if(resource_exists::<UnitView>),
@@ -446,6 +446,7 @@ pub fn build_world(files: &GameFiles, scene: &mut crate::terrain::Scene) -> Buil
         warn!("drive tracks not found in game.exe; vehicles will turn on the spot");
     }
     let mut world = World::new(map, tracks);
+    if let Some(init) = &scene.scenario { world.initialize_campaign_random(init.random_seed); }
     world.blockage_delay = scene.blockage_delay;
     world.sight_height_step = scene.sight_height_step;
     world.build_rules = scene.build_rules;
@@ -481,7 +482,12 @@ pub fn build_world(files: &GameFiles, scene: &mut crate::terrain::Scene) -> Buil
             });
         }
     }
-    if scene.allies_allowed {
+    if let Some(init) = &scene.scenario {
+        world.houses = init.houses.iter().map(|house| house.state.clone()).collect();
+        world.map.viewer = init.local;
+        house_palettes = scene.house_palettes.clone();
+    }
+    if scene.scenario.is_none() && scene.allies_allowed {
         world.paranoid_alliances();
     }
     let mut catalog = Vec::new();
@@ -499,6 +505,7 @@ pub fn build_world(files: &GameFiles, scene: &mut crate::terrain::Scene) -> Buil
     world.map.condition_yellow = scene.condition_yellow as f64;
     world.ai_rules = scene.ai_rules.clone();
     world.ability_rules = scene.ability_rules.clone();
+    world.damage_fire_rules = scene.damage_fire_rules.clone();
     world.rockets = scene.rockets;
     world.rad_rules = scene.rad_rules;
     (world.bridges_destroyable, world.bridge_strength) = scene.bridge_rules;
@@ -600,6 +607,10 @@ pub fn build_world(files: &GameFiles, scene: &mut crate::terrain::Scene) -> Buil
     let mut voices = HashMap::new();
     for spawn in std::mem::take(&mut scene.unit_spawns) {
         let id = world.add_unit(spawn.cell, spawn.facing, spawn.stats, spawn.owner);
+        if let Some(initial) = spawn.initial {
+            world.initialize_scenario_unit(id, initial.health, initial.veterancy);
+            scene.scenario_objects.push((initial, ra2_sim::combat::Aim::Unit(id)));
+        }
         voices.insert(id, (spawn.voice_select, spawn.voice_move));
         looks.insert(id, (spawn.image, spawn.palette));
     }
@@ -609,7 +620,11 @@ pub fn build_world(files: &GameFiles, scene: &mut crate::terrain::Scene) -> Buil
             continue;
         };
         let stats = kind.stats;
-        if let Some(id) = world.add_infantry(soldier.cell, soldier.spot, soldier.facing, stats, crate::terrain::NEUTRAL) {
+        if let Some(id) = world.add_infantry(soldier.cell, soldier.spot, soldier.facing, stats, soldier.owner) {
+            if let Some(initial) = soldier.initial {
+                world.initialize_scenario_unit(id, initial.health, initial.veterancy);
+                scene.scenario_objects.push((initial, ra2_sim::combat::Aim::Unit(id)));
+            }
             let kind = &kinds[soldier.kind as usize];
             voices.insert(id, (kind.voice_select.clone(), kind.voice_move.clone()));
             looks.insert(id, (kind.image.clone(), soldier.palette));
@@ -618,7 +633,11 @@ pub fn build_world(files: &GameFiles, scene: &mut crate::terrain::Scene) -> Buil
     // The buildings the map starts with.
     let mut building_palettes = HashMap::new();
     for structure in &scene.map_structures {
-        let id = world.add_map_building(crate::terrain::NEUTRAL, structure.kind, structure.cell, structure.health);
+        let id = world.add_map_building(structure.owner, structure.kind, structure.cell, structure.health);
+        world.initialize_map_building_facing(id, structure.facing);
+        if let Some(initial) = &structure.initial {
+            scene.scenario_objects.push((initial.clone(), ra2_sim::combat::Aim::Building(id)));
+        }
         building_palettes.insert(id, structure.palette);
     }
     for &(cell, overlay, data) in &scene.walls {
@@ -848,12 +867,15 @@ fn clear(mut commands: Commands) {
     commands.remove_resource::<UnitView>();
 }
 
-fn tick(sim: ResMut<Sim>) {
+fn tick(sim: ResMut<Sim>, capture: Option<Res<crate::debug::CaptureTick>>) {
     // RA2_SPEED=n runs the simulation n times as fast, for getting to a later
     // state quickly when checking something.
     let speed = std::env::var("RA2_SPEED").ok().and_then(|n| n.trim().parse().ok()).unwrap_or(1u32);
     let mut sim = sim;
     for _ in 0..speed.max(1) {
+        if capture.as_ref().is_some_and(|target| sim.0.current_tick() >= target.0) {
+            break;
+        }
         tick_once(&mut sim);
     }
 }
@@ -1420,6 +1442,41 @@ mod draw_order_tests {
     use super::*;
 
     #[test]
+    fn screenshot_capture_holds_zero_and_exact_ticks_then_can_resume() {
+        let mut app = App::new();
+        app.insert_resource(Sim(World::new(Map::new(1, 1), None), Vec::new(), Vec::new()))
+            .insert_resource(crate::debug::CaptureTick(0))
+            .add_systems(Update, tick);
+        app.update();
+        assert_eq!(app.world().resource::<Sim>().0.current_tick(), 0);
+        app.insert_resource(crate::debug::CaptureTick(2));
+        for _ in 0..5 { app.update(); }
+        assert_eq!(app.world().resource::<Sim>().0.current_tick(), 2);
+        app.world_mut().remove_resource::<crate::debug::CaptureTick>();
+        app.update();
+        assert!(app.world().resource::<Sim>().0.current_tick() > 2);
+    }
+
+    #[test]
+    fn damage_fire_projection_matches_original_full_world_truncation() {
+        // Original CoordToClient with its initialized Z transform, not art
+        // offsets independently rounded onto the parent's draw point.
+        for (coords, expected) in [
+            ((14080, 18432, 416), (-480.0, 1845.0)),
+            ((14515, 18253, 416), (-408.0, 1860.0)),
+            ((14498, 19225, 416), (-523.0, 1915.0)),
+        ] {
+            assert_eq!(damage_fire_point(Vec2::ZERO, coords), Vec2::from(expected));
+        }
+        for (z, expected) in [
+            (i32::MIN, -308171635), (-104, -14), (-1, 0), (0, 0), (104, 15), (416, 60),
+            (727, 104), (728, 105), (729, 106), (832, 120), (16777217, 2407592), (i32::MAX, 308171637),
+        ] {
+            assert_eq!(damage_fire_height(z), expected, "original initialized AdjustForZ at {z}");
+        }
+    }
+
+    #[test]
     fn infantry_in_one_cell_draw_from_the_rear_spot_to_the_front_spot() {
         let cell = (135, 80);
         let at = |dx, dy| (cell.0 * LEPTONS_PER_CELL + dx, cell.1 * LEPTONS_PER_CELL + dy);
@@ -1767,6 +1824,7 @@ fn show_buildings(
                 commands.entity(entity).despawn();
                 continue;
             };
+            sprite.3 = matches!(part, PartDepth::Body(..) | PartDepth::Flat(..)) || name.starts_with("vxl:");
             // Held by a time weapon it is
             // drawn half see-through, as a unit is.
             let alpha = if building.frozen.is_some() { 0.5 } else { 1.0 };
@@ -1814,7 +1872,7 @@ fn show_buildings(
             };
             let mut spawned = commands.spawn((
                 DespawnOnExit(Screen::InGame),
-                BuildingSprite(building.id, index, Some(key)),
+                BuildingSprite(building.id, index, Some(key), matches!(part, PartDepth::Body(..) | PartDepth::Flat(..)) || name.starts_with("vxl:")),
                 Sprite::from_image(handle),
                 Transform::from_translation(place),
                 visibility,
@@ -1836,6 +1894,87 @@ enum PartDepth {
     Flat(i32, bool),
     /// Upright and only tested, by its adjustment.
     Upright(i32),
+}
+
+/// Renderer identity only; animation state and ownership live in the simulation.
+#[derive(Component)]
+struct DamageFireSprite(u32, usize);
+
+/// Original CoordToClient truncates signed XY before applying the viewport
+/// origin. Rounding the projected relative fire offset moves the second
+/// NANRCT fire one pixel left and down.
+fn damage_fire_point(origin: Vec2, (x, y, z): (i32, i32, i32)) -> Vec2 {
+    origin + Vec2::new(
+        x.wrapping_sub(y).wrapping_mul(CELL_WIDTH / 2).wrapping_div(LEPTONS_PER_CELL) as f32 + (CELL_WIDTH / 2) as f32,
+        x.wrapping_add(y).wrapping_mul(CELL_HEIGHT / 2).wrapping_div(LEPTONS_PER_CELL) as f32 - damage_fire_height(z) as f32,
+    )
+}
+
+fn damage_fire_height(z: i32) -> i32 {
+    let scale = f64::from_bits(0x3fc2_5e53_7434_4960);
+    (z as f64 * scale + if z >= 728 { 1.0 } else { 0.0 } + 0.5) as i32
+}
+
+fn show_damage_fires(
+    mut commands: Commands,
+    sim: Res<Sim>,
+    files: Res<GameFiles>,
+    mut view: ResMut<UnitView>,
+    mut images: ResMut<Assets<Image>>,
+    mut shown: Query<(Entity, &DamageFireSprite, &mut Sprite, &mut Transform, &mut Visibility, Option<&mut Depth>)>,
+) {
+    let view = &mut *view;
+    let existing: HashMap<_, _> = shown.iter().map(|(entity, fire, ..)| ((fire.0, fire.1), entity)).collect();
+    let mut wanted = std::collections::HashSet::new();
+    for building in sim.0.buildings() {
+        for (slot, fire) in building.damage_fires.iter().enumerate().filter_map(|(slot, fire)| Some((slot, fire.as_ref()?))) {
+            let identity = (building.id, slot);
+            wanted.insert(identity);
+            let Some(kind) = sim.0.damage_fire_rules.types.get(fire.type_index as usize) else { continue };
+            let Some(anim) = view.anim_types.get(&kind.id) else { continue };
+            let (name, opacity, y_offset) = (anim.image.clone(), anim.opacity, anim.y_draw_offset);
+            let art = &mut view.art;
+            let image = view.effect_images.entry((name.clone(), fire.frame as usize)).or_insert_with(|| {
+                let drawn = art.effect(&files, &name, fire.frame as usize)?;
+                let size = Vec2::new(drawn.width as f32, drawn.height as f32);
+                let image = Image::new(
+                    Extent3d { width: drawn.width, height: drawn.height, depth_or_array_layers: 1 },
+                    TextureDimension::D2, drawn.rgba, TextureFormat::Rgba8UnormSrgb, RenderAssetUsages::RENDER_WORLD,
+                );
+                Some((images.add(image), Vec2::new(drawn.offset.0 as f32, drawn.offset.1 as f32) + size / 2.0))
+            }).clone();
+            let cell = (fire.coords.0.div_euclid(LEPTONS_PER_CELL), fire.coords.1.div_euclid(LEPTONS_PER_CELL));
+            let lit = Lit { cell, level: sim.0.map.level(cell.0, cell.1) as i32, rule: LightRule::Object { extra: 0 } };
+            // Anim.Draw uses gradient2 and its own ZAdjust, independently of
+            // the parent building's body shape and ExtraLight.
+            let depth = Depth::Upright { adjust: fire.z_adjust + y_offset - damage_fire_height(fire.coords.2) - 2, write: false };
+            let draw_z = 2.0 + ((fire.coords.0 as f32 + fire.coords.1 as f32) / LEPTONS_PER_CELL as f32 + 2.0) * DEPTH_PER_ROW;
+            let point = damage_fire_point(view.origin, fire.coords) + Vec2::new(0.0, y_offset as f32);
+            let (handle, transform, visibility) = match image {
+                Some((handle, middle)) => {
+                    let centre = point + middle;
+                    (handle, Transform::from_xyz(centre.x, -centre.y, draw_z), Visibility::Inherited)
+                }
+                None => (Handle::default(), Transform::default(), Visibility::Hidden),
+            };
+            if let Some(entity) = existing.get(&identity) {
+                let Ok((_, _, mut sprite, mut old_transform, mut old_visibility, old_depth)) = shown.get_mut(*entity) else { continue };
+                if sprite.image != handle { sprite.image = handle; }
+                let colour = Color::WHITE.with_alpha(opacity);
+                if sprite.color != colour { sprite.color = colour; }
+                if *old_transform != transform { *old_transform = transform; }
+                if *old_visibility != visibility { *old_visibility = visibility; }
+                commands.entity(*entity).insert(lit);
+                set_depth(&mut commands, *entity, old_depth, depth);
+            } else {
+                commands.spawn((DespawnOnExit(Screen::InGame), DamageFireSprite(building.id, slot),
+                    Sprite { image: handle, color: Color::WHITE.with_alpha(opacity), ..default() }, transform, visibility, lit, depth, crate::lighting::AnimationPalette));
+            }
+        }
+    }
+    for (identity, entity) in existing {
+        if !wanted.contains(&identity) { commands.entity(entity).despawn(); }
+    }
 }
 
 /// A sprite of a wall piece or its shadow.
@@ -2248,16 +2387,18 @@ fn light_world(sim: Res<Sim>, storm: Option<ResMut<StormLight>>, light: Option<R
 
 /// Tints the units and buildings by the light where they stand.
 fn light_units(
+    mut commands: Commands,
     sim: Res<Sim>,
     view: Res<UnitView>,
     light: Option<Res<WorldLight>>,
-    mut units: Query<(&UnitSprite, &mut Sprite), Without<BuildingSprite>>,
-    mut buildings: Query<(&BuildingSprite, &mut Sprite), Without<UnitSprite>>,
+    mut units: Query<(Entity, &UnitSprite, &mut Sprite, Option<&crate::lighting::PaletteLight>), Without<BuildingSprite>>,
+    mut buildings: Query<(Entity, &BuildingSprite, &mut Sprite, Option<&crate::lighting::PaletteLight>), Without<UnitSprite>>,
 ) {
     let Some(light) = light else {
         return;
     };
-    for (sprite, mut picture) in &mut units {
+    let native = std::env::var_os("RA2_NODEPTH").is_none();
+    for (entity, sprite, mut picture, current) in &mut units {
         let Some(unit) = sim.0.unit(sprite.0) else {
             continue;
         };
@@ -2271,12 +2412,18 @@ fn light_units(
         } else {
             light.setup.extra_unit
         };
-        let wanted = curtained(light.colour(&Lit { cell, level, rule: LightRule::Object { extra } }, picture.color.alpha()), &sim.0, unit.curtain_until);
+        let rule = LightRule::Object { extra };
+        let colour = if native {
+            let wanted = light.palette_light(cell, level, rule);
+            if current != Some(&wanted) { commands.entity(entity).insert(wanted); }
+            Color::WHITE.with_alpha(picture.color.alpha())
+        } else { light.colour(&Lit { cell, level, rule }, picture.color.alpha()) };
+        let wanted = curtained(colour, &sim.0, unit.curtain_until);
         if picture.color != wanted {
             picture.color = wanted;
         }
     }
-    for (sprite, mut picture) in &mut buildings {
+    for (entity, sprite, mut picture, current) in &mut buildings {
         let Some(building) = sim.0.buildings().iter().find(|b| b.id == sprite.0) else {
             continue;
         };
@@ -2284,9 +2431,16 @@ fn light_units(
             continue;
         }
         let level = sim.0.map.level(building.cell.0, building.cell.1) as i32;
-        // Plus the type's `ExtraLight`.
-        let extra = light.setup.buildings.get(building.kind as usize).map_or(0, |b| b.1);
-        let wanted = curtained(light.colour(&Lit { cell: building.cell, level, rule: LightRule::Object { extra } }, picture.color.alpha()), &sim.0, building.curtain_until);
+        // Attached animations inherit ambient light; the body's draw adds
+        // the type's ExtraLight before the palette row is chosen.
+        let extra = if sprite.3 { light.setup.buildings.get(building.kind as usize).map_or(0, |b| b.1) } else { 0 };
+        let rule = LightRule::Object { extra };
+        let colour = if native {
+            let wanted = light.palette_light(building.cell, level, rule);
+            if current != Some(&wanted) { commands.entity(entity).insert(wanted); }
+            Color::WHITE.with_alpha(picture.color.alpha())
+        } else { light.colour(&Lit { cell: building.cell, level, rule }, picture.color.alpha()) };
+        let wanted = curtained(colour, &sim.0, building.curtain_until);
         if picture.color != wanted {
             picture.color = wanted;
         }
@@ -2899,6 +3053,7 @@ fn show_effects(
     mut picks: Local<u32>,
     mut radar_events: ResMut<crate::radar::RadarEvents>,
     mut status: MessageWriter<crate::bar::Status>,
+    recording: Option<ResMut<crate::saves::Recording>>,
 ) {
     let Some(armoury) = armoury else {
         return;
@@ -2922,7 +3077,11 @@ fn show_effects(
             spawned.insert(Depth::Upright { adjust: -2 - height, write: false });
         }
     };
-    for event in sim.0.take_events() {
+    let events = sim.0.take_events();
+    if let Some(mut recording) = recording.filter(|_| sim.0.mission_data.is_some() && !events.is_empty()) {
+        recording.presentation.push(crate::saves::MissionPresentationStep { tick, input: crate::saves::MissionPresentationInput::DrainCombatEvents { count: events.len() } });
+    }
+    for event in events {
         use ra2_sim::combat::Event;
         match event {
             Event::Fired { weapon, at, to, facing, by } => {

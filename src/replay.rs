@@ -34,20 +34,11 @@ fn replay() {
     // defeated, and what it had left a little before.
     if std::env::var_os("REPLAY_DEFEATS").is_some() {
         let mut world = crate::saves::replay(&files, &save, 0).expect("the replay");
-        let mut orders: Vec<_> = recording.orders.iter().collect();
-        orders.reverse();
+        let mut position = crate::saves::ReplayPosition::after_tick(recording, world.current_tick());
         let mut down = vec![false; world.houses.len()];
         while world.current_tick() < to {
             let tick = world.current_tick();
-            while orders.last().is_some_and(|(at, _)| *at <= tick) {
-                world.order(orders.pop().unwrap().1);
-            }
-            world.tick();
-            for event in world.take_events() {
-                if let ra2_sim::combat::Event::HouseDefeated { house } = event {
-                    eprintln!("REPLAY {tick}: house {house} defeated (event)");
-                }
-            }
+            crate::saves::replay_advance(&mut world, recording, &mut position, tick + 1).expect("the replay step");
             for house in 0..world.houses.len() {
                 if world.houses[house].defeated && !down[house] {
                     down[house] = true;
@@ -61,18 +52,15 @@ fn replay() {
     let quiet_to = if watch.is_some() { to.saturating_sub(trace) } else { to };
     let mut world = crate::saves::replay(&files, &save, quiet_to).expect("the replay");
     if let Some(id) = watch {
-        let mut orders: Vec<_> = recording.orders.iter().filter(|(at, _)| *at >= world.current_tick()).collect();
-        orders.reverse();
+        let mut position = crate::saves::ReplayPosition::after_tick(recording, world.current_tick());
         // Not yet built is not gone.
         let mut seen = false;
         while world.current_tick() < to {
             let tick = world.current_tick();
-            while orders.last().is_some_and(|(at, _)| *at <= tick) {
-                let (_, order) = orders.pop().unwrap();
+            for (_, order) in recording.orders.iter().filter(|(at, _)| *at == tick) {
                 eprintln!("REPLAY {tick}: order {order:?}");
-                world.order(*order);
             }
-            world.tick();
+            crate::saves::replay_advance(&mut world, recording, &mut position, tick + 1).expect("the replay step");
             if let Some(unit) = world.unit(id) {
                 seen = true;
                 eprintln!(
@@ -124,7 +112,10 @@ fn replay() {
     if to == save.tick {
         // The saved state, laid over a fresh world, must be what the replay
         // reached.
-        let mut saved = crate::game::match_world(&files, &save.setup).expect("the map");
+        let mut saved = match &save.campaign {
+            Some(run) => crate::campaign_world::world(&files, run).expect("the campaign map"),
+            None => crate::game::match_world(&files, &save.setup).expect("the map"),
+        };
         saved.restore(&save.state).expect("the saved state");
         // REPLAY_MOVE=unit,x,y loads the save, sends a unit and follows it.
         if let Some([unit, x, y]) = std::env::var("REPLAY_MOVE").ok().and_then(|text| {

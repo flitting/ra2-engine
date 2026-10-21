@@ -116,6 +116,7 @@ pub fn load(ai: &Ini, rules: &Ini, unit: &dyn Fn(&str) -> Option<u16>, building:
         task_forces,
         scripts,
         team_delays: triple("TeamDelays", [2000, 2500, 3500]).map(|v| v.max(1) as u32),
+        fill_earliest_probability: triple("FillEarliestTeamProbability", defaults.fill_earliest_probability),
         min_defensive: triple("MinimumAIDefensiveTeams", [1; 3]),
         max_defensive: triple("MaximumAIDefensiveTeams", [2; 3]),
         team_cap: triple("TotalAITeamCap", [30; 3]),

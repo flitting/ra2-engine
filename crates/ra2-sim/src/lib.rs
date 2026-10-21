@@ -6,6 +6,7 @@ pub mod abilities;
 pub mod ai;
 pub mod aircraft;
 pub mod bridges;
+pub mod building_fires;
 pub mod combat;
 pub mod flight;
 pub mod path;
@@ -15,8 +16,13 @@ pub mod ore;
 pub mod slaves;
 pub mod smudge;
 pub mod snapshot;
+pub mod mission;
+pub mod native_random;
+mod production_probability;
 pub mod spawns;
 mod soldiers;
+pub mod infantry_idle;
+pub mod diplomacy;
 pub mod endgame;
 pub mod supers;
 pub mod powerups;
@@ -591,6 +597,12 @@ impl Map {
     // rings out to the radius, at most 10, round the cell the viewer is drawn
     // over (its own, back by half its height level).
     pub fn reveal(&mut self, house: u8, cell: (i32, i32), level: i32, radius: i32) {
+        self.reveal_with_height(house, cell, level, radius, true);
+    }
+
+    /// Existing sight raster with the retail RevealByHeight gate. The public
+    /// helper keeps its pre-campaign behavior; mission rules pass their flag.
+    pub(crate) fn reveal_with_height(&mut self, house: u8, cell: (i32, i32), level: i32, radius: i32, by_height: bool) {
         if !self.shroud_on || radius <= 0 {
             return;
         }
@@ -604,7 +616,7 @@ impl Map {
             // levels above the viewer.
             let (sx, sy) = sight_step(dx, dy);
             let (tx, ty) = (cell.0 + dx + 2 + sx, cell.1 + dy + 2 + sy);
-            if self.index(tx, ty).is_some() && self.level(tx, ty) as i32 > level + 3 {
+            if by_height && self.index(tx, ty).is_some() && self.level(tx, ty) as i32 > level + 3 {
                 continue;
             }
             if let Some(index) = self.index(centre.0 + dx, centre.1 + dy) {
@@ -836,6 +848,15 @@ impl Map {
     pub fn set_playfield(&mut self, width: i32, height: i32, local: [i32; 4]) {
         self.playfield = Some((width, local));
         self.size_height = height;
+    }
+
+    /// Original `CoordinatesLegal`: the full `Size` diamond, independent of
+    /// `LocalSize`, terrain height and whether our cell storage contains it.
+    /// Synthetic maps without a `Size` use their ordinary storage rectangle.
+    pub fn coordinates_legal(&self, x: i32, y: i32) -> bool {
+        let Some((width, _)) = self.playfield else { return self.index(x, y).is_some(); };
+        let (x, y, width, height) = (i64::from(x), i64::from(y), i64::from(width), i64::from(self.size_height));
+        width < x + y && x + y <= width + 2 * height && x - y < width && y - x < width
     }
 
     /// The side of the square round the whole diamond map, `Size` width plus
@@ -1477,10 +1498,13 @@ pub struct Unit {
 }
 
 /// Where in a cell each foot-soldier spot is, from the cell's corner.
-// Five spots; the game uses 2, 3 and 4.
+// Ordinary movement uses 2, 3 and 4. ScenarioInit infantry Unlimbo can force
+// the centre (0), including several soldiers on that same position.
 const SPOT_OFFSETS: [(i32, i32); 5] = [(128, 128), (64, 64), (192, 64), (64, 192), (192, 192)];
 /// The occupation bits of the three spots in use.
 const SPOT_BITS: u8 = 0x1c;
+/// Any infantry subposition, including ScenarioInit's forced centre.
+const ALL_SPOT_BITS: u8 = 0x1f;
 
 /// The spot a position within a cell belongs to: 0 near the middle or in the top
 /// quarter, else 2, 3 or 4.
@@ -1649,6 +1673,8 @@ pub struct AnimatedTerrain {
 /// A kind of building, from rules.ini and art.ini.
 #[derive(Clone, Debug, Default)]
 pub struct BuildingType {
+    /// Original art DamageFireOffset0..7; the first(0,0) ends the list.
+    pub damage_fire_offsets: [(i32, i32); 8],
     /// Yuri slave-miner workforce; separate from an ordinary refinery.
     pub slave_spawner: Option<slaves::SpawnerRules>,
     pub deploy_facing: Option<u8>,
@@ -2015,6 +2041,9 @@ pub struct House {
     pub aircraft_queue: Vec<u16>,
     /// The house's country, as its place in rules.ini `[Countries]`.
     pub country: u8,
+    /// The one-hop ParentCountry index used by `Owner` checks. Missing parent
+    /// lookup is bit 31 in the original x86 mask; None retains stock setup.
+    pub parent_country: Option<u8>,
     /// Its side: 0 Allied, 1 Soviet, 2 Yuri.
     pub side: i32,
     /// The highest `TechLevel` it may build.
@@ -2051,6 +2080,10 @@ pub struct House {
 }
 
 impl House {
+    pub fn production_country(&self) -> u8 {
+        self.parent_country.unwrap_or(self.country)
+    }
+
     /// What is in production for the buildings tab or for the defences tab.
     pub fn slot(&self, combat: bool) -> Option<Production> {
         if combat { self.defence } else { self.production }
@@ -2105,6 +2138,8 @@ pub struct Building {
     pub kind: u16,
     /// Health left, out of the type's `strength`.
     pub health: i32,
+    pub damage_fires_active: bool,
+    pub damage_fires: [Option<building_fires::DamageFire>; 8],
     /// The top cell of its foundation, and the foundation's size in cells.
     pub cell: (i32, i32),
     pub size: (i32, i32),
@@ -2323,6 +2358,10 @@ impl Order {
 }
 
 pub struct World {
+    /// Immutable campaign rules and the mutable state saved with a campaign.
+    /// `None` keeps the ordinary skirmish tick and random stream unchanged.
+    pub mission_data: Option<mission::MissionData>,
+    pub mission_state: Option<mission::MissionState>,
     /// Whether houses can be defeated and the game end (off in tests that
     /// arrange things as no game would); the short game option; and, once the
     /// game is over, the houses left.
@@ -2344,6 +2383,10 @@ pub struct World {
     // bit per cell, set on the cell a unit rests in and on the cells its track runs
     // into. Not original behaviour: remembering which unit set it.
     claims: Vec<u32>,
+    /// A campaign reinforcement can place several vehicles in the same cell:
+    /// ScenarioInit bypasses CanEnterCell in the original Unlimbo. Keep every
+    /// claim until its owner leaves, rather than replacing the previous one.
+    stacked_claims: Vec<(usize, Vec<u32>)>,
     /// The foot-soldier spots taken in each cell (bits 4, 8 and 16), and the house
     /// that has them.
     spots: Vec<u8>,
@@ -2404,6 +2447,7 @@ pub struct World {
     /// `ConditionRed`: the share of its strength at or below which a thing is
     /// badly damaged.
     pub condition_red: f64,
+    pub damage_fire_rules: building_fires::Rules,
     /// `IdleActionFrequency`: sets how often a soldier at rest fidgets.
     pub idle_frequency: f64,
     /// `C4Delay` in frames.
@@ -2470,6 +2514,9 @@ pub struct World {
     pub slave_rules: slaves::Rules,
     pub(crate) slave_pools: Vec<slaves::Pool>,
     random: u64,
+    /// Original Scenario.Random for audited campaign consumers. Legacy and
+    /// presentation consumers stay separate until their stream is established.
+    campaign_random: Option<native_random::NativeRandom>,
     /// The stream soldiers' fidgets are drawn from.
     // Not original behaviour: the engine draws them from its one stream; kept
     // apart here so that soldiers standing about do not change every other
@@ -2498,8 +2545,11 @@ impl World {
             map.build_zones();
         }
         Self {
+            mission_data: None,
+            mission_state: None,
             // The second half is the layer of bridge decks.
             claims: vec![0; map.passable.len() * 2],
+            stacked_claims: Vec::new(),
             spots: vec![0; map.passable.len()],
             spot_house: vec![u8::MAX; map.passable.len()],
             blockage_delay: DEFAULT_BLOCKAGE_DELAY,
@@ -2538,6 +2588,7 @@ impl World {
             missile_rot_var: 0.25,
             targeting_delay: 27,
             condition_red: 0.25,
+            damage_fire_rules: building_fires::Rules::default(),
             idle_frequency: 0.15,
             c4_delay: 27,
             reload_delay: 270,
@@ -2593,6 +2644,7 @@ impl World {
             slave_rules: slaves::Rules::default(),
             slave_pools: Vec::new(),
             random: 0x2545_f491_4f6c_dd1d,
+            campaign_random: None,
             idle_random: 0x9e37_79b9_7f4a_7c15,
             tick: 0,
             next_id: 0,
@@ -2601,9 +2653,21 @@ impl World {
 
     /// Adds a unit at the centre of a cell and returns its id.
     pub fn add_unit(&mut self, cell: (i32, i32), facing: u8, stats: UnitStats, owner: u8) -> u32 {
+        let unit = self.make_unit(cell, facing, stats, owner);
+        let id = unit.id;
+        self.units.push(unit);
+        if let Some(index) = self.map.index(cell.0, cell.1) {
+            self.claims[index] = id + 1;
+        }
+        id
+    }
+
+    /// Allocates an initialized object without putting it on the map. Used by
+    /// campaign reinforcement construction before its separate Unlimbo pass.
+    fn make_unit(&mut self, cell: (i32, i32), facing: u8, stats: UnitStats, owner: u8) -> Unit {
         let id = self.next_id;
         self.next_id += 1;
-        self.units.push(Unit::new(id, owner, cell, facing, stats));
+        let mut unit = Unit::new(id, owner, cell, facing, stats);
         // A gunner vehicle starts with its first
         // weapon and turret.
         let gun = (stats.kind as usize).checked_sub(1).and_then(|k| self.unit_types.get(k)).filter(|k| k.gunner).and_then(|k| k.gunner_weapons.first().copied());
@@ -2613,21 +2677,16 @@ impl World {
         let naval = (stats.kind as usize).checked_sub(1).and_then(|k| self.unit_types.get(k)).is_some_and(|k| k.naval);
         let veteran = stats.trainable
             && self.houses.get(owner as usize).is_some_and(|house| if stats.infantry { house.veterans[0] } else { house.veterans[1] && stats.plane.is_none() && !naval });
-        if let Some(unit) = self.units.last_mut() {
-            unit.gun = gun;
-            if veteran {
-                unit.veterancy = 1.0;
-                unit.shown_rank = 1;
-            }
+        unit.gun = gun;
+        if veteran {
+            unit.veterancy = 1.0;
+            unit.shown_rank = 1;
         }
         let ground = self.map.level(cell.0, cell.1) as i32 * combat::LEVEL_HEIGHT;
-        if let Some(jet) = self.units.last_mut().and_then(|unit| unit.jet.as_mut()) {
+        if let Some(jet) = unit.jet.as_mut() {
             *jet = flight::Jet::on_ground(ground);
         }
-        if let Some(index) = self.map.index(cell.0, cell.1) {
-            self.claims[index] = id + 1;
-        }
-        id
+        unit
     }
 
     /// Adds a foot soldier on one of a cell's spots (2, 3 or 4; anything else
@@ -2672,12 +2731,72 @@ impl World {
         (self.random >> 16) as u32 & 0x7fff_ffff
     }
 
+    /// Initializes a new campaign's original Scenario.Random before loading
+    /// its objects. A fixed seed is useful for reproduction; the original new
+    /// game instead uses GetTickCount or a nonzero override. Saves retain the
+    /// complete stream, including rejected range draws, not just this seed.
+    pub fn initialize_campaign_random(&mut self, seed: u32) {
+        self.campaign_random = Some(native_random::NativeRandom::seed(seed));
+    }
+
+    /// The complete original stream, exposed for deterministic verification.
+    pub fn campaign_random_state(&self) -> Option<&native_random::NativeRandom> {
+        self.campaign_random.as_ref()
+    }
+
+    /// Use only for audited Scenario.Random.Range callers. The fallback keeps
+    /// the old stream and its one-word/equal-endpoint consumption unchanged.
+    pub(crate) fn scenario_random_range(&mut self, minimum: i32, maximum: i32) -> i32 {
+        if let Some(random) = &mut self.campaign_random { return random.ranged(minimum, maximum); }
+        debug_assert!(minimum <= maximum);
+        minimum + self.random_below((maximum as i64 - minimum as i64 + 1) as u32) as i32
+    }
+
     pub fn units(&self) -> &[Unit] {
         &self.units
     }
 
     pub fn unit(&self, id: u32) -> Option<&Unit> {
         self.units.iter().find(|unit| unit.id == id)
+    }
+
+    /// Registered Foot identity, including live objects held off-map. This is
+    /// deliberately separate from unit(): passengers cannot receive ordinary
+    /// on-map orders or participate in map target/leader searches.
+    pub(crate) fn registered_unit(&self, id: u32) -> Option<&Unit> {
+        fn find(unit: &Unit, id: u32) -> Option<&Unit> {
+            if unit.id == id { return Some(unit); }
+            unit.cargo.iter().chain(unit.parasite.iter()).find_map(|child| find(child, id))
+        }
+        self.units.iter().find_map(|unit| find(unit, id))
+            .or_else(|| self.buildings.iter().find_map(|building| building.occupants.iter().chain(building.patients.iter().map(|(_, unit)| unit)).find_map(|unit| find(unit, id))))
+            .or_else(|| self.leaps.iter().find_map(|leap| find(&leap.biter, id)))
+    }
+
+    pub(crate) fn registered_unit_mut(&mut self, id: u32) -> Option<&mut Unit> {
+        fn find(unit: &mut Unit, id: u32) -> Option<&mut Unit> {
+            if unit.id == id { return Some(unit); }
+            unit.cargo.iter_mut().chain(unit.parasite.iter_mut()).find_map(|child| find(child, id))
+        }
+        self.units.iter_mut().find_map(|unit| find(unit, id))
+            .or_else(|| self.buildings.iter_mut().find_map(|building| building.occupants.iter_mut().chain(building.patients.iter_mut().map(|(_, unit)| unit)).find_map(|unit| find(unit, id))))
+            .or_else(|| self.leaps.iter_mut().find_map(|leap| find(&mut leap.biter, id)))
+    }
+
+    /// Apply a scenario placement's 0..256 health fraction and veterancy after
+    /// creating its unit. Setup uses this instead of test-only mutable access.
+    /// A successful initialization does not draw from either random stream.
+    pub fn initialize_scenario_unit(&mut self, id: u32, health_256: i32, veterancy: f64) -> bool {
+        if !veterancy.is_finite() || veterancy < 0.0 {
+            return false;
+        }
+        let Some(unit) = self.units.iter_mut().find(|unit| unit.id == id) else {
+            return false;
+        };
+        unit.health = (unit.stats.strength.max(0) as i64 * health_256.clamp(0, 256) as i64 / 256) as i32;
+        unit.veterancy = veterancy;
+        unit.shown_rank = unit.rank();
+        true
     }
 
     pub fn buildings(&self) -> &[Building] {
@@ -2757,7 +2876,7 @@ impl World {
             return false;
         };
         let others: Vec<Other> = self.others();
-        entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), &others, &self.buildings, unit, cell, None, unit.cell(), -1) <= code::CLOAK
+        entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, unit, cell, None, unit.cell(), -1) <= code::CLOAK
     }
 
     /// Whether a building can pack up into a vehicle.
@@ -2828,6 +2947,8 @@ impl World {
             owner,
             kind,
             health: self.building_types.get(kind as usize).map_or(1, |kind| kind.strength),
+            damage_fires_active: false,
+            damage_fires: Default::default(),
             cell: origin,
             size,
             buildup: None,
@@ -2903,6 +3024,14 @@ impl World {
         building.buildup = None;
         building.health = (full as i64 * health.clamp(1, 256) as i64 / 256).max(1) as i32;
         building.id
+    }
+
+    /// Restores a preplaced building's authored turret direction before its
+    /// first update. Original Unlimbo passes the map byte as a 16-bit turn.
+    pub fn initialize_map_building_facing(&mut self, id: u32, facing: u8) -> bool {
+        let Some(building) = self.buildings.iter_mut().find(|building| building.id == id) else { return false };
+        building.arms = combat::Arms::facing(facing);
+        true
     }
 
     /// A build-up animation for a building type, from its first image.
@@ -3199,6 +3328,18 @@ impl World {
         let owner = &mut self.houses[house as usize];
         *owner.tab_slot_mut(tab) = None;
         owner.credits += cost - production.balance;
+        self.clear_campaign_production_choice(house, tab);
+    }
+
+    fn clear_campaign_production_choice(&mut self, house: u8, tab: usize) {
+        if let Some(brain) = self.houses.get_mut(house as usize).and_then(|house| house.ai.as_mut()).filter(|brain| brain.campaign.is_some()) {
+            match tab {
+                2 => brain.build_infantry = None,
+                3 | 4 => brain.build_unit = None,
+                5 => brain.build_aircraft = None,
+                _ => {}
+            }
+        }
     }
 
     /// Production belongs to a house, but still needs a compatible factory.
@@ -3313,7 +3454,7 @@ impl World {
         let others: Vec<Other> = self.others();
         let free = |cell: (i32, i32)| {
             self.map.index(cell.0, cell.1).is_some()
-                && entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), &others, &self.buildings, &probe, cell, None, cell, -1) == code::OK
+                && entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, &probe, cell, None, cell, -1) == code::OK
         };
         let special = if factory.gdi_barracks {
             Some((origin.0 + 1, origin.1 + 2))
@@ -3420,6 +3561,7 @@ impl World {
         let Some(index) = self.buildings.iter().position(|b| b.id == id) else {
             return;
         };
+        self.register_mission_destruction(combat::Aim::Building(id), false);
         let building = self.demolish(index);
         let refund = self.refund(building.kind);
         if let Some(house) = self.houses.get_mut(building.owner as usize) {
@@ -3430,7 +3572,9 @@ impl World {
 
     /// Takes a building off the map and opens its cells again.
     pub(crate) fn demolish(&mut self, index: usize) -> Building {
-        let building = self.buildings.remove(index);
+        let mut building = self.buildings.remove(index);
+        building.damage_fires.fill(None);
+        building.damage_fires_active = false;
         self.cancel_orphaned_production();
         for dy in 0..building.size.1 {
             for dx in 0..building.size.0 {
@@ -3488,6 +3632,12 @@ impl World {
         // waits `RepairDelay` times 225 to 1800 frames, drawn at random, before
         // it starts another.
         for house in 1..self.houses.len() {
+            if self.mission_data.as_ref().is_some_and(|data| data.passive_houses.contains(&(house as u8))) {
+                continue;
+            }
+            if self.houses[house].ai.as_ref().and_then(|brain| brain.campaign.as_ref()).is_some_and(|control| control.iq < self.campaign_iq_rules().repair_sell) {
+                continue;
+            }
             let Some((difficulty, due)) = self.houses[house].ai.as_ref().map(|brain| (brain.difficulty.min(2), brain.repair_at)) else {
                 continue;
             };
@@ -3571,6 +3721,27 @@ impl World {
         self.units.insert(at, unit);
     }
 
+    /// Unlimbo in ScenarioInit inserts at the cell's object-list head even
+    /// when another vehicle is already there. This is intentionally separate
+    /// from normal spawn/production placement, which checks cell entry.
+    fn claim_scenario_cell(&mut self, index: usize, id: u32) {
+        if let Some((_, owners)) = self.stacked_claims.iter_mut().find(|entry| entry.0 == index) {
+            owners.retain(|&other| other != id + 1);
+            owners.insert(0, id + 1);
+        } else if self.claims[index] != 0 && self.claims[index] != id + 1 {
+            self.stacked_claims.push((index, vec![id + 1, self.claims[index]]));
+        }
+        self.claims[index] = id + 1;
+    }
+
+    fn remove_stacked_claims(&mut self, id: u32) {
+        for (index, owners) in &mut self.stacked_claims {
+            owners.retain(|&other| other != id + 1);
+            self.claims[*index] = owners.first().copied().unwrap_or(0);
+        }
+        self.stacked_claims.retain(|(_, owners)| owners.len() > 1);
+    }
+
     /// Takes a unit off the map, freeing the ground it held.
     fn lift(&mut self, index: usize) -> Unit {
         self.leave_dock(index);
@@ -3580,10 +3751,12 @@ impl World {
                 *claim = 0;
             }
         }
+        self.remove_stacked_claims(unit.id);
         if unit.stats.infantry {
             let (x, y) = unit.head_to.unwrap_or((unit.x, unit.y));
             if let Some(at) = self.map.index(x.div_euclid(LEPTONS_PER_CELL), y.div_euclid(LEPTONS_PER_CELL)) {
                 self.spots[at] &= !(1 << spot_index(x, y));
+                if spot_index(x, y) == 0 && self.spots[at] & SPOT_BITS == 0 { self.spot_house[at] = u8::MAX; }
             }
         }
         unit
@@ -3666,7 +3839,7 @@ impl World {
             let (here, behind, owner) = (self.units[index].cell(), (self.units[index].heading() + 4) & 7, self.units[index].owner);
             let others: Vec<Other> = self.others();
             let free = |world: &Self, passenger: &Unit, cell: (i32, i32)| {
-                entry_code(&world.map, &world.claims, (&world.spots, &world.spot_house), &others, &world.buildings, passenger, cell, None, cell, -1) == code::OK
+                entry_code(&world.map, &world.claims, &world.stacked_claims, (&world.spots, &world.spot_house), &others, &world.buildings, passenger, cell, None, cell, -1) == code::OK
             };
             let way = (0..8).map(|turn| (behind + turn) & 7).find(|&dir| free(self, &passenger, step(here, dir)));
             let Some(dir) = way else {
@@ -3888,7 +4061,7 @@ impl World {
                 return false;
             }
         }
-        entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), others, &self.buildings, unit, cell, None, cell, -1) == code::OK
+        entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), others, &self.buildings, unit, cell, None, cell, -1) == code::OK
     }
 
     /// The ore cell a miner would go for within a number of cells.
@@ -4144,6 +4317,7 @@ impl World {
                             self.claims[at] = 0;
                         }
                     }
+                    self.remove_stacked_claims(id);
                     if let Some(at) = self.map.index(spot.0, spot.1) {
                         self.claims[at] = id + 1;
                     }
@@ -4504,7 +4678,23 @@ impl World {
         self.placement(house, building, origin).iter().all(|(_, ok)| *ok)
     }
 
-    /// The player's things lift the shroud round themselves.
+    /// Whether the local player can command a House's objects. In campaign,
+    /// House.human includes both IsHumanPlayer and PlayerControl from the map;
+    /// in other sessions only the local player's own House is controlled.
+    pub fn house_controlled_by(&self, house: u8, player: u8) -> bool {
+        self.houses.get(house as usize).is_some_and(|owner| if self.mission_data.is_some() { owner.human } else { house == player })
+    }
+
+    fn shares_sight_with(&self, owner: u8, viewer: u8) -> bool {
+        let (Some(_), Some(recipient)) = (self.houses.get(owner as usize), self.houses.get(viewer as usize)) else { return false; };
+        if owner == viewer { return true; }
+        let Some(data) = &self.mission_data else { return false; };
+        let country_bit = 1u32.wrapping_shl(recipient.country as u32);
+        data.radar_visible_to.iter().rev().find(|(house, _)| *house == owner).is_some_and(|(_, mask)| mask & country_bit != 0)
+            || (data.ally_reveal && self.allied(owner, viewer))
+    }
+
+    /// Eligible owners' things lift the current player's shroud.
     // A unit looks out to its `Sight` when it appears, in each new cell, and
     // every 15 frames while it moves; only the local player has a shroud. A
     // ground unit sees 10% further for every `LeptonsPerSightIncrease` (2000)
@@ -4516,6 +4706,13 @@ impl World {
         if !self.map.shroud_on {
             return;
         }
+        if let Some(data) = &self.mission_data {
+            // Native RevealArea gates use one CurrentPlayer, not the union of
+            // all human/PlayerControl Houses. Other sessions retain their
+            // existing separate per-human shrouds.
+            self.look_for(data.player_house);
+            return;
+        }
         // Every person's house has its own shroud.
         for human in 0..self.houses.len().min(32) as u8 {
             if self.houses[human as usize].human {
@@ -4525,6 +4722,8 @@ impl World {
     }
 
     fn look_for(&mut self, human: u8) {
+        let sources: Vec<bool> = (0..self.houses.len()).map(|owner| self.shares_sight_with(owner as u8, human)).collect();
+        let reveal_by_height = self.mission_data.as_ref().is_none_or(|data| data.reveal_by_height);
         // With a `SpySat` building
         // (not being sold) everything is revealed; when the last is lost
         // everything goes dark and the player's things look again.
@@ -4535,10 +4734,10 @@ impl World {
             self.map.satellite ^= house_bit(human);
             self.map.reveal_all(human, has);
             if !has {
-                for unit in self.units.iter_mut().filter(|unit| unit.owner == human) {
+                for unit in self.units.iter_mut().filter(|unit| sources.get(unit.owner as usize).copied().unwrap_or(false)) {
                     unit.looked = None;
                 }
-                for building in self.buildings.iter_mut().filter(|building| building.owner == human) {
+                for building in self.buildings.iter_mut().filter(|building| sources.get(building.owner as usize).copied().unwrap_or(false)) {
                     building.looked = false;
                 }
             }
@@ -4577,17 +4776,17 @@ impl World {
                         }
                     }
                 }
-                for unit in self.units.iter_mut().filter(|unit| unit.owner == human) {
+                for unit in self.units.iter_mut().filter(|unit| sources.get(unit.owner as usize).copied().unwrap_or(false)) {
                     unit.looked = None;
                 }
-                for building in self.buildings.iter_mut().filter(|building| building.owner == human) {
+                for building in self.buildings.iter_mut().filter(|building| sources.get(building.owner as usize).copied().unwrap_or(false)) {
                     building.looked = false;
                 }
             }
         }
         for index in 0..self.units.len() {
             let unit = &self.units[index];
-            if unit.owner != human {
+            if !sources.get(unit.owner as usize).copied().unwrap_or(false) {
                 continue;
             }
             let cell = unit.cell();
@@ -4603,18 +4802,18 @@ impl World {
                 (unit.stats.fighter.sight as f64 * (1.0 + bonus as f64 * 0.01)) as i32
             };
             self.units[index].looked = Some(cell);
-            self.map.reveal(human, cell, level, sight);
+            self.map.reveal_with_height(human, cell, level, sight, reveal_by_height);
         }
         for index in 0..self.buildings.len() {
             let building = &self.buildings[index];
-            if building.owner != human || building.looked {
+            if !sources.get(building.owner as usize).copied().unwrap_or(false) || building.looked {
                 continue;
             }
             let cell = (building.cell.0 + building.size.0 / 2, building.cell.1 + building.size.1 / 2);
             let sight = self.building_types.get(building.kind as usize).map_or(0, |kind| kind.fighter.sight);
             let level = self.map.level(cell.0, cell.1) as i32;
             self.buildings[index].looked = true;
-            self.map.reveal(human, cell, level, sight);
+            self.map.reveal_with_height(human, cell, level, sight, reveal_by_height);
         }
     }
 
@@ -4702,6 +4901,7 @@ impl World {
                 self.landing_orders.push(order);
                 return;
             }
+            self.clear_unit_mission(id);
             // Any order ends a guard of the ground round a post; the next
             // place it is left at becomes the post.
             if let Some(unit) = self.units.iter_mut().find(|u| u.id == id) {
@@ -5278,7 +5478,10 @@ impl World {
 
     /// Advances the simulation by one step.
     pub fn tick(&mut self) {
+        if self.mission_simulation_stopped() { return; }
         self.tick += 1;
+        self.run_mission();
+        if self.run_mission_endgame() { return; }
         self.cancel_orphaned_production();
         // Production advances a tick at a time and is paid for as it goes. When a
         // stage's time is up the stage goes on and the step is paid: the balance
@@ -5330,6 +5533,7 @@ impl World {
                                 }
                             }
                             *self.houses[index].tab_slot_mut(tab) = None;
+                            self.clear_campaign_production_choice(index as u8, tab);
                             self.start_next_queued(index as u8, tab);
                         }
                     }
@@ -5425,6 +5629,7 @@ impl World {
             self.finish_sale(building);
         }
         self.repair_buildings();
+        self.run_building_damage_fires();
         for building in opened {
             self.grand_opening(building);
         }
@@ -5449,6 +5654,7 @@ impl World {
         self.run_defeat();
         self.run_spawns();
         self.run_teams();
+        self.run_unit_missions();
         self.think();
         self.look();
 
@@ -5463,45 +5669,64 @@ impl World {
         let mut scatter = Vec::new();
         let mut attack = Vec::new();
         let mut entering = Vec::new();
-        {
-            let Self { map, tracks, claims, units, buildings, spots, spot_house, random, .. } = self;
-            for (index, unit) in units.iter_mut().enumerate() {
-                let mut ground = Ground {
-                    map,
-                    claims,
-                    spots,
-                    spot_house,
-                    random,
-                    others: &others,
-                    buildings,
-                    tracks: tracks.as_ref(),
-                    blockage_delay: self.blockage_delay as u64,
-                    path_delay: self.path_delay as u64,
-                    close_enough: self.close_enough,
-                    now: self.tick,
-                    scatter: &mut scatter,
-                    attack: &mut attack,
-                    entering: &mut entering,
-                };
-                let before = unit.cell();
-                // A soldier digging in, dug in or getting up goes nowhere.
-                let rooted = unit.stats.infantry && unit.stance != combat::Stance::Standing;
-                if unit.frozen.is_none() && !rooted {
-                    advance(unit, &mut ground);
-                }
-                // At a
-                // change of cell: onto a bridge cell whose ground is four
-                // levels lower, it is on the deck; off bridge cells, it is not.
-                let after = unit.cell();
-                if after != before {
-                    let (old, new) = (ground.map.level(before.0, before.1) as i32, ground.map.level(after.0, after.1) as i32);
-                    if new == old - 4 && ground.map.bridged(after.0, after.1) {
-                        unit.on_bridge = true;
-                    } else if !ground.map.bridged(after.0, after.1) && ground.map.bridged(before.0, before.1) {
-                        unit.on_bridge = false;
+        let mission_entries = self.mission_state.is_some();
+        let mission_airborne_entries = self.tick % 16 == 0 && self.mission_data.as_ref().is_some_and(|data| data.yuri);
+        // A Tag's actions run at PCP.End before the same drive consumes its
+        // remaining points, and before the next Foot is processed. Snapshot
+        // identities so a reinforcement created by an action does not acquire
+        // an extra movement turn in this already-started pass.
+        let moving: Vec<u32> = self.units.iter().map(|unit| unit.id).collect();
+        for id in moving {
+            let mut first = true;
+            loop {
+                let Some(index) = self.units.iter().position(|unit| unit.id == id) else { break; };
+                if !first && self.mission_data.is_some() && self.units[index].health <= 0 { break; }
+                let (arrived, resume) = {
+                    let Self { map, tracks, claims, stacked_claims, units, buildings, spots, spot_house, random, campaign_random, .. } = self;
+                    let unit = &mut units[index];
+                    let mut ground = Ground {
+                        map, claims, stacked_claims, spots, spot_house, random,
+                        campaign_random: campaign_random.as_mut(),
+                        others: &others, buildings, tracks: tracks.as_ref(),
+                        blockage_delay: self.blockage_delay as u64,
+                        path_delay: self.path_delay as u64,
+                        close_enough: self.close_enough, now: self.tick,
+                        scatter: &mut scatter, attack: &mut attack, entering: &mut entering,
+                        mission_entries,
+                    };
+                    let before = unit.cell();
+                    let was_tethered = unit.tethered;
+                    let rooted = unit.stats.infantry && unit.stance != combat::Stance::Standing;
+                    let arrived = if unit.frozen.is_some() || rooted { false }
+                        else if first { advance(unit, &mut ground) }
+                        else { advance_track(unit, &mut ground) };
+                    let after = unit.cell();
+                    if after != before {
+                        let (old, new) = (ground.map.level(before.0, before.1) as i32, ground.map.level(after.0, after.1) as i32);
+                        if new == old - 4 && ground.map.bridged(after.0, after.1) {
+                            unit.on_bridge = true;
+                        } else if !ground.map.bridged(after.0, after.1) && ground.map.bridged(before.0, before.1) {
+                            unit.on_bridge = false;
+                        }
                     }
+                    if let Some(other) = others.iter_mut().find(|other| other.id == id) {
+                        *other = Other { allies: other.allies, ..Other::of(unit) };
+                    }
+                    (arrived, !unit.stats.infantry && !(was_tethered && !unit.tethered))
+                };
+                if !arrived { break; }
+                if self.mission_state.is_some() {
+                    self.register_mission_cell_entry(id);
+                    // Actions may add/remove objects or change their ownership.
+                    others = self.others();
                 }
-                others[index] = Other { allies: others[index].allies, ..Other::of(unit) };
+                if !resume { break; }
+                first = false;
+            }
+            if mission_airborne_entries && self.register_mission_airborne_event(id) {
+                // CellTag actions are synchronous and may change the placed
+                // objects seen by the next Foot in this pass.
+                others = self.others();
             }
         }
         // A unit held up by a friend at rest asks that cell to clear with no
@@ -5582,6 +5807,7 @@ impl World {
         }
         // Engineers and garrisons can change ownership during this tick.
         self.cancel_orphaned_production();
+        self.finish_mission_deletions();
     }
 
     /// Asks whatever vehicle is resting in a cell to move to a neighbouring one.
@@ -5712,13 +5938,15 @@ impl World {
         let others: Vec<Other> = self.others();
         let mut none = Vec::new();
         let mut no_attack = Vec::new();
-        let Self { map, tracks, claims, units, buildings, spots, spot_house, random, .. } = self;
+        let Self { map, tracks, claims, stacked_claims, units, buildings, spots, spot_house, random, campaign_random, .. } = self;
         let ground = Ground {
             map,
             claims,
+            stacked_claims,
             spots,
             spot_house,
             random,
+            campaign_random: campaign_random.as_mut(),
             others: &others,
             buildings,
             tracks: tracks.as_ref(),
@@ -5729,6 +5957,7 @@ impl World {
             scatter: &mut none,
             attack: &mut no_attack,
             entering: &mut Vec::new(),
+            mission_entries: false,
         };
         let unit = &mut units[index];
         let here = unit.cell();
@@ -5759,7 +5988,9 @@ impl World {
         let Some(index) = self.buildings.iter().position(|b| b.id == building) else {
             return;
         };
-        let packed = self.buildings.remove(index);
+        let mut packed = self.buildings.remove(index);
+        packed.damage_fires.fill(None);
+        packed.damage_fires_active = false;
         self.cancel_orphaned_production();
         let kind = self.building_types[packed.kind as usize].clone();
         for dy in 0..packed.size.1 {
@@ -5774,6 +6005,7 @@ impl World {
         };
         let facing = kind.deploy_facing.unwrap_or(DEPLOY_FACING);
         let id = self.add_unit((packed.cell.0 + 1, packed.cell.1 + 1), facing, stats, packed.owner);
+        self.transfer_mission_tag(combat::Aim::Building(building), combat::Aim::Unit(id));
         self.transfer_slave_host(slaves::Host::Building(building), slaves::Host::Unit(id));
         if let Some(unit) = self.units.iter_mut().find(|u| u.id == id) {
             let health = packed.health as i64 * stats.strength as i64 / kind.strength.max(1) as i64;
@@ -5816,10 +6048,12 @@ impl World {
         for claim in self.claims.iter_mut().filter(|claim| **claim == deployed.id + 1) {
             *claim = 0;
         }
+        self.remove_stacked_claims(deployed.id);
         if let Some(kind) = deployed.stats.deploys_into {
             self.add_building(deployed.owner, kind, Self::deploy_origin(deployed.cell()));
-            if let Some(building) = self.buildings.last() {
-                self.transfer_slave_host(slaves::Host::Unit(id), slaves::Host::Building(building.id));
+            if let Some(building) = self.buildings.last().map(|building| building.id) {
+                self.transfer_mission_tag(combat::Aim::Unit(id), combat::Aim::Building(building));
+                self.transfer_slave_host(slaves::Host::Unit(id), slaves::Host::Building(building));
             }
             let full = self.building_types.get(kind as usize).map_or(1, |kind| kind.strength);
             if let Some(building) = self.buildings.last_mut() {
@@ -5842,6 +6076,13 @@ impl World {
         };
         mix(self.tick as i64);
         mix(self.random as i64);
+        if let Some(random) = &self.campaign_random {
+            mix(random.is_frozen() as i64);
+            let (first, second) = random.indices();
+            mix(first as i64);
+            mix(second as i64);
+            for &word in random.table_words() { mix(word as i64); }
+        }
         for object in &self.animated {
             mix(object.stage as i64);
             mix(object.playing as i64);
@@ -5984,9 +6225,11 @@ enum Scatter {
 struct Ground<'a> {
     map: &'a Map,
     claims: &'a mut Vec<u32>,
+    stacked_claims: &'a mut Vec<(usize, Vec<u32>)>,
     spots: &'a mut Vec<u8>,
     spot_house: &'a mut Vec<u8>,
     random: &'a mut u64,
+    campaign_random: Option<&'a mut native_random::NativeRandom>,
     /// The other units, in id order.
     others: &'a [Other],
     buildings: &'a [Building],
@@ -6001,11 +6244,14 @@ struct Ground<'a> {
     attack: &'a mut Vec<(u32, (i32, i32))>,
     /// Units setting off into a cell, and the cell (where a crate is picked up).
     entering: &'a mut Vec<(u32, (i32, i32))>,
+    /// Stop at PCP.End only when a campaign needs synchronous notifications.
+    /// Other sessions retain the original unsplit movement pass.
+    mission_entries: bool,
 }
 
 impl Ground<'_> {
     fn holder(&self, cell: (i32, i32), me: u32) -> Option<&Other> {
-        holder(self.map, self.claims, self.others, cell, me, false)
+        holder(self.map, self.claims, self.stacked_claims, self.others, cell, me, false)
     }
 
     // A bridge cell keeps what is on its
@@ -6014,7 +6260,13 @@ impl Ground<'_> {
         if let Some(index) = self.map.index(cell.0, cell.1) {
             let deck = self.map.bridged(cell.0, cell.1) && (unit_level(self.map, unit) - self.map.level(cell.0, cell.1) as i32).abs() > 1;
             let half = self.claims.len() / 2;
-            self.claims[index + if deck { half } else { 0 }] = unit.id + 1;
+            let index = index + if deck { half } else { 0 };
+            if let Some((_, owners)) = self.stacked_claims.iter_mut().find(|entry| entry.0 == index) {
+                if !owners.contains(&(unit.id + 1)) { owners.insert(0, unit.id + 1); }
+                self.claims[index] = owners[0];
+            } else {
+                self.claims[index] = unit.id + 1;
+            }
         }
     }
 
@@ -6022,10 +6274,14 @@ impl Ground<'_> {
         if let Some(index) = self.map.index(cell.0, cell.1) {
             let half = self.claims.len() / 2;
             for at in [index, index + half] {
-                if self.claims[at] == me + 1 {
+                if let Some((_, owners)) = self.stacked_claims.iter_mut().find(|entry| entry.0 == at) {
+                    owners.retain(|&other| other != me + 1);
+                    self.claims[at] = owners.first().copied().unwrap_or(0);
+                } else if self.claims[at] == me + 1 {
                     self.claims[at] = 0;
                 }
             }
+            self.stacked_claims.retain(|(_, owners)| owners.len() > 1);
         }
     }
 
@@ -6046,7 +6302,7 @@ impl Ground<'_> {
     }
 
     fn can_enter_at(&self, unit: &Unit, to: (i32, i32), dir: Option<usize>, from: (i32, i32), level: i32) -> u8 {
-        entry_code(self.map, self.claims, (self.spots, self.spot_house), self.others, self.buildings, unit, to, dir, from, level)
+        entry_code(self.map, self.claims, self.stacked_claims, (self.spots, self.spot_house), self.others, self.buildings, unit, to, dir, from, level)
     }
 
     /// What a step into a cell costs the search.
@@ -6143,7 +6399,7 @@ impl Ground<'_> {
         for dy in -2..=2 {
             for dx in -2..=2 {
                 let cell = (ahead.0 + dx, ahead.1 + dy);
-                let occupied = self.map.index(cell.0, cell.1).is_some_and(|index| self.claims[index] != 0 || self.spots[index] & SPOT_BITS != 0);
+                let occupied = self.map.index(cell.0, cell.1).is_some_and(|index| self.claims[index] != 0 || self.spots[index] & ALL_SPOT_BITS != 0);
                 if occupied && cell != here {
                     toggle(cell);
                 }
@@ -6312,8 +6568,10 @@ fn unit_level(map: &Map, unit: &Unit) -> i32 {
     map.level(cell.0, cell.1) as i32 + if unit.on_bridge { 4 } else { 0 }
 }
 
-fn holder<'a>(map: &Map, claims: &[u32], others: &'a [Other], cell: (i32, i32), me: u32, deck: bool) -> Option<&'a Other> {
-    let claim = claims[map.index(cell.0, cell.1)? + if deck { claims.len() / 2 } else { 0 }];
+fn holder<'a>(map: &Map, claims: &[u32], stacked_claims: &[(usize, Vec<u32>)], others: &'a [Other], cell: (i32, i32), me: u32, deck: bool) -> Option<&'a Other> {
+    let index = map.index(cell.0, cell.1)? + if deck { claims.len() / 2 } else { 0 };
+    let claim = stacked_claims.iter().find(|entry| entry.0 == index)
+        .map_or(claims[index], |(_, owners)| owners.iter().copied().find(|&id| id != me + 1).unwrap_or(0));
     if claim == 0 || claim == me + 1 {
         return None;
     }
@@ -6333,6 +6591,7 @@ fn holder<'a>(map: &Map, claims: &[u32], others: &'a [Other], cell: (i32, i32), 
 fn entry_code(
 map: &Map,
 claims: &[u32],
+stacked_claims: &[(usize, Vec<u32>)],
 spots: (&[u8], &[u8]),
 others: &[Other],
 buildings: &[Building],
@@ -6399,7 +6658,7 @@ level: i32,
     // What is on the other layer
     // of a bridge cell is not in the way.
     let bridge_cell = map.bridged(to.0, to.1);
-    if let Some(other) = holder(map, claims, others, to, unit.id, deck) {
+    if let Some(other) = holder(map, claims, stacked_claims, others, to, unit.id, deck) {
         if unit.boarding == Some(other.id) && unit.stats.infantry {
             // Its own transport: the soldier walks on to a spot of the cell.
         } else if !friend_of(others, unit, other.owner) && other.cloaked {
@@ -6445,16 +6704,16 @@ level: i32,
     let index = map.index(to.0, to.1).unwrap_or(0);
     let taken = if bridge_cell {
         let here = others.iter().filter(|other| other.infantry && other.cell == to && other.on_bridge == deck && other.id != unit.id).count();
-        if here == 0 { 0 } else if here >= 3 { SPOT_BITS } else { spots.0[index] & SPOT_BITS }
+        if here == 0 { 0 } else if here >= 3 { SPOT_BITS } else { spots.0[index] & ALL_SPOT_BITS }
     } else {
-        spots.0[index] & SPOT_BITS
+        spots.0[index] & ALL_SPOT_BITS
     };
     let tree = map.tree_bits[index];
     if taken == 0 {
         return result;
     }
     // A tree's spots and the soldiers' between them fill the cell.
-    if unit.stats.infantry && tree != 0 && (taken | tree) == SPOT_BITS && spots.1[index] == unit.owner {
+    if unit.stats.infantry && tree != 0 && (taken | tree) & SPOT_BITS == SPOT_BITS && spots.1[index] == unit.owner {
         return result.max(code::TEMP);
     }
     if !friend_of(others, unit, spots.1[index]) {
@@ -6478,7 +6737,7 @@ level: i32,
     if unit.stats.infantry {
         // Friends share a cell; a full one is a
         // temporary block if all three are at rest, else a moving one.
-        if taken == SPOT_BITS && result < code::MOVING_BLOCK {
+        if taken & SPOT_BITS == SPOT_BITS && result < code::MOVING_BLOCK {
             result = if resting == 3 { code::TEMP } else { code::MOVING_BLOCK };
         }
     } else {
@@ -6528,7 +6787,7 @@ fn nearby(
     let close_to = near.close_to;
     let zone = unit.stats.movement_zone as usize;
     let fits = |cell: (i32, i32)| {
-        map.index(cell.0, cell.1).is_some_and(|index| claims[index] == 0 && spots[index] & SPOT_BITS == 0)
+        map.index(cell.0, cell.1).is_some_and(|index| claims[index] == 0 && spots[index] & ALL_SPOT_BITS == 0)
             && map.in_playfield(cell.0, cell.1)
             && (near.any_zone || map.zones.as_ref().is_none_or(|zones| unit_zones(map, zones, unit).contains(&dest_zone(map, cell, zone))))
             && map.speed_on(cell.0, cell.1, unit.stats.speed_type, true) > 0
@@ -6614,31 +6873,30 @@ fn lepton_distance(unit: &Unit, cell: (i32, i32)) -> i64 {
 // A unit on a track follows it, and starts the next
 // one in the same tick if it ends; a unit off a track that is turning only turns;
 // otherwise it tries to start a track.
-fn advance(unit: &mut Unit, ground: &mut Ground) {
+fn advance(unit: &mut Unit, ground: &mut Ground) -> bool {
     if unit.plane.is_some() {
-        return;
+        return false;
     }
     if unit.jet.is_some() {
         flight::fly(unit, ground);
-        return;
+        return false;
     }
     if unit.stats.infantry {
-        walk(unit, ground);
-        return;
+        return walk(unit, ground);
     }
     if unit.drive.is_none() {
         if unit.tethered {
-            return;
+            return false;
         }
         if unit.turn.remaining > 0 {
             unit.turn.remaining -= 1;
             unit.facing = (unit.turn.current() >> 8) as u8;
-            return;
+            return false;
         }
         if !start_of_move(unit, ground, true, false) {
             unit.fraction = 0;
             unit.progress = 0;
-            return;
+            return false;
         }
     }
 
@@ -6672,18 +6930,26 @@ fn advance(unit: &mut Unit, ground: &mut Ground) {
     }
     let speed = unit.speed as i64 * unit.fraction as i64 / UNIT_FRACTION as i64;
     unit.progress += speed as i32;
+    advance_track(unit, ground)
+}
+
+/// Resume the same frame's accumulated drive movement after a synchronous
+/// PCP.End notification. The speed must only be accumulated once per tick.
+fn advance_track(unit: &mut Unit, ground: &mut Ground) -> bool {
     while unit.progress > SPEED_PER_TRACK_POINT {
         if unit.drive.is_none() && !start_of_move(unit, ground, true, false) {
             break;
         }
         unit.progress -= SPEED_PER_TRACK_POINT;
-        follow_track(unit, ground);
+        let arrived = follow_track(unit, ground);
         if unit.tethered && unit.drive.is_none() {
             unit.tethered = false;
             unit.left_factory = true;
-            break;
+            return arrived;
         }
+        if arrived && ground.mission_entries { return true; }
     }
+    false
 }
 
 /// The zones a unit standing in a cell can set out into: the cell's own, or,
@@ -6826,7 +7092,10 @@ impl Ground<'_> {
             2 => [2, 4, 3],
             3 => [3, 4, 2],
             4 => [4, 2, 3],
-            _ => [[2, 3, 4], [2, 3, 4], [3, 4, 2], [4, 2, 3]][(random_step(self.random) % 4) as usize],
+            _ => {
+                let pick = self.campaign_random.as_mut().map_or_else(|| random_step(self.random) % 4, |random| random.ranged(0, 3) as u32);
+                [[2, 3, 4], [2, 3, 4], [3, 4, 2], [4, 2, 3]][pick as usize]
+            }
         };
         let spot = order.into_iter().find(|&spot| free(spot))?;
         Some((cell.0 * LEPTONS_PER_CELL + SPOT_OFFSETS[spot].0, cell.1 * LEPTONS_PER_CELL + SPOT_OFFSETS[spot].1))
@@ -6838,7 +7107,7 @@ impl Ground<'_> {
 // ground or slope factor; the facing is turned to the spot at once; within 17
 // leptons the soldier is put on the spot, and the next frame it chooses its next
 // hop, so each cell costs two frames standing.
-fn walk(unit: &mut Unit, ground: &mut Ground) {
+fn walk(unit: &mut Unit, ground: &mut Ground) -> bool {
     if let Some(head) = unit.head_to {
         let (dx, dy) = (head.0 - unit.x, head.1 - unit.y);
         if (path::engine_sqrt((dx * dx + dy * dy) as f32) as i32) < 17 {
@@ -6851,7 +7120,7 @@ fn walk(unit: &mut Unit, ground: &mut Ground) {
                 give_up(unit);
                 unit.stepping = false;
             }
-            return;
+            return true;
         }
         let aim = ((((unit.y - head.1) as f64).atan2((head.0 - unit.x) as f64) - std::f64::consts::FRAC_PI_2) * -10430.06) as i32;
         let facing = aim as u16;
@@ -6868,22 +7137,22 @@ fn walk(unit: &mut Unit, ground: &mut Ground) {
         unit.fraction = UNIT_FRACTION;
         unit.x = (unit.x as f64 + angle.cos() * speed) as i32;
         unit.y = (unit.y as f64 - angle.sin() * speed) as i32;
-        return;
+        return false;
     }
     let Some(dest) = unit.dest else {
         unit.fraction = 0;
         unit.stepping = false;
-        return;
+        return false;
     };
     if unit.path[0] < 0 {
         if dest == unit.cell() {
             give_up(unit);
             unit.stepping = false;
-            return;
+            return false;
         }
         if ground.now < unit.path_timer {
             unit.stepping = false;
-            return;
+            return false;
         }
         if !ground.find_path(unit, Mode::Normal) {
             unit.stepping = false;
@@ -6894,12 +7163,13 @@ fn walk(unit: &mut Unit, ground: &mut Ground) {
                 Some(_) => unit.retries -= 1,
                 None => give_up(unit),
             }
-            return;
+            return false;
         }
         unit.path_timer = ground.now + ground.path_delay;
         unit.retries = 10;
     }
     next_hop(unit, ground, true);
+    false
 }
 
 /// Chooses a foot soldier's next spot from the first step of its path.
@@ -7172,9 +7442,9 @@ fn start_of_move(unit: &mut Unit, ground: &mut Ground, first_try: bool, no_curve
 }
 
 /// Moves a unit to the next point of its track.
-fn follow_track(unit: &mut Unit, ground: &mut Ground) {
+fn follow_track(unit: &mut Unit, ground: &mut Ground) -> bool {
     let Some(mut drive) = unit.drive else {
-        return;
+        return false;
     };
     // With the first point the unit lets go of the
     // cell it is leaving, and is no longer counted as blocked.
@@ -7191,17 +7461,17 @@ fn follow_track(unit: &mut Unit, ground: &mut Ground) {
         // Not original behaviour: without the engine's tracks the unit goes
         // straight from cell to cell, and keeps the cell it leaves until it is
         // out of it.
-        step_straight(unit, drive);
+        let arrived = step_straight(unit, drive);
         if drive.from != drive.head && unit.cell() != drive.from {
             ground.release(drive.from, unit.id);
         }
-        return;
+        return arrived;
     };
     let entry = tracks.selector[drive.selector];
     let track = &tracks.tracks[entry.track as usize];
     let Some(&point) = track.points.get(drive.index) else {
         unit.drive = None;
-        return;
+        return false;
     };
     let (x, y, facing) = entry.place(point);
     let (hx, hy) = cell_centre(drive.head);
@@ -7230,18 +7500,19 @@ fn follow_track(unit: &mut Unit, ground: &mut Ground) {
             ground.release(via, unit.id);
         }
         unit.drive = None;
-        return;
+        return true;
     }
 
     // Joining the next curve part-way, at the track's
     // jump point, is only for `Passive` vehicles (train carriages); everything else
     // runs each track to its end.
     unit.drive = Some(drive);
+    false
 }
 
 /// Moves a unit one point towards the cell its drive ends in, in a straight line.
 /// Used only when the engine's track tables are not available.
-fn step_straight(unit: &mut Unit, mut drive: Drive) {
+fn step_straight(unit: &mut Unit, mut drive: Drive) -> bool {
     let (tx, ty) = cell_centre(drive.head);
     let (dx, dy) = (tx - unit.x, ty - unit.y);
     let point = if dx != 0 && dy != 0 { DIAGONAL_POINT } else { STRAIGHT_POINT };
@@ -7255,6 +7526,7 @@ fn step_straight(unit: &mut Unit, mut drive: Drive) {
     }
     drive.index += 1;
     unit.drive = if (unit.x, unit.y) == (tx, ty) { None } else { Some(drive) };
+    unit.drive.is_none()
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ pub mod fnt;
 pub mod ini;
 pub mod lcw;
 pub mod map;
+pub mod mission;
 pub mod mix;
 pub mod pal;
 pub mod pcx;

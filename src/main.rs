@@ -5,6 +5,8 @@ mod aidata;
 mod armoury;
 mod audio;
 mod bar;
+mod campaign;
+mod campaign_world;
 mod beams;
 mod colors;
 mod control;
@@ -77,7 +79,7 @@ fn main() {
         )
         .add_plugins((shell::ShellPlugin, game::GamePlugin, hud::HudPlugin, units::UnitsPlugin, debug::DebugPlugin, audio::AudioPlugin, cursor::CursorPlugin, control::ControlPlugin, pause::PausePlugin, radar::RadarPlugin, shroud::ShroudPlugin, beams::BeamsPlugin))
         .add_plugins((video::VideoPlugin, bar::BarPlugin, endgame::EndGamePlugin, saves::SavesPlugin, net::NetPlugin, notice::NoticePlugin, depth::DepthPlugin))
-        .add_plugins((movie::MoviePlugin, loading::LoadingPlugin, resample::ResamplePlugin))
+        .add_plugins((movie::MoviePlugin, loading::LoadingPlugin, resample::ResamplePlugin, campaign::CampaignPlugin))
         .run();
 }
 

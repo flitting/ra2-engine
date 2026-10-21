@@ -276,6 +276,9 @@ impl World {
                 }
             }
         }
+        // Object's falling completion clears IsFalling, then sends PCP.End
+        // while the landed Foot is still registered, before its next mission.
+        for &id in &landed { self.register_mission_cell_entry(id); }
         // One that fell with a bridge dies where
         // it lands, on land or water.
         let doomed: Vec<u32> = landed.iter().copied().filter(|&id| self.unit(id).is_some_and(|unit| unit.doomed)).collect();

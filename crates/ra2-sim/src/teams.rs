@@ -18,6 +18,105 @@ mod yr_tests {
     use super::*;
     use crate::{House, Map};
 
+    fn production_choice_world(needs: &[u32], ages: &[u64], probability: i32, campaign: bool) -> World {
+        let mut map = Map::new(12, 12);
+        for y in 0..12 { for x in 0..12 { map.set_cell(x, y, true, 0); } }
+        let mut world = World::new(map, None);
+        world.houses = vec![House { credits: 1000, tech_level: 10, ai: Some(crate::ai::Brain::for_campaign(1, crate::ai::CampaignState::default())), ..House::default() }];
+        world.building_types.push(crate::BuildingType { size: (1, 1), strength: 100, factory: Some(Factory::Unit), owners: 1, ..crate::BuildingType::default() });
+        world.add_map_building(0, 0, (4, 4), 256);
+        world.team_data.scripts.push(vec![(5, 100)]);
+        world.team_data.fill_earliest_probability = [probability; 3];
+        for (kind, &need) in needs.iter().enumerate() {
+            world.unit_types.push(crate::UnitType { cost: 1, tech_level: 1, owners: 1, stats: crate::UnitStats { kind: kind as u16 + 1, strength: 100, ..crate::UnitStats::default() }, ..crate::UnitType::default() });
+            world.team_data.task_forces.push(vec![(need, kind as u16)]);
+            world.team_data.team_types.push(TeamType { task_force: kind, ..TeamType::default() });
+        }
+        if campaign {
+            world.initialize_campaign_random(0);
+            world.attach_mission(crate::mission::MissionData { id: "production-tail".into(), ..crate::mission::MissionData::default() }).unwrap();
+        }
+        for (kind, &age) in ages.iter().enumerate() {
+            let team = world.create_team(0, kind).unwrap();
+            world.teams.iter_mut().find(|entry| entry.id == team).unwrap().created = age;
+        }
+        world
+    }
+
+    fn control_production_words(world: &mut World, words: &[u32]) {
+        let mut bytes = vec![0];
+        bytes.extend(0u16.to_le_bytes()); bytes.extend(103u16.to_le_bytes());
+        bytes.extend(250u64.to_le_bytes());
+        for index in 0..250 { bytes.extend(words.get(index).copied().unwrap_or(0).to_le_bytes()); }
+        world.campaign_random = Some(bincode::deserialize(&bytes).unwrap());
+    }
+
+    #[test]
+    fn production_choice_matches_original_cpu_golden_profiles_and_request_counts() {
+        let mut count = 0;
+        for line in include_str!("../tests/data/production_choice_native.tsv").lines().filter(|line| !line.starts_with('#')) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let probability = fields[1].parse().unwrap();
+            let draw = fields[2].parse().unwrap();
+            let second = fields[3].parse().unwrap();
+            let needs: Vec<u32> = fields[4].split(',').map(|value| value.parse().unwrap()).collect();
+            let ages: Vec<u64> = fields[5].split(',').map(|value| value.parse().unwrap()).collect();
+            let allowed: Vec<i32> = fields[6].split(',').map(|value| value.parse().unwrap()).collect();
+            let costs: Vec<i32> = fields[7].split(',').map(|value| value.parse().unwrap()).collect();
+            let mut world = production_choice_world(&needs, &ages, probability, true);
+            world.houses[0].credits = fields[8].parse().unwrap();
+            for (index, kind) in world.unit_types.iter_mut().enumerate() {
+                kind.owners = if allowed[index] != 0 { 1 } else { 2 };
+                kind.cost = costs[index];
+            }
+            control_production_words(&mut world, &[draw, second]);
+            let expected: i32 = fields[9].parse().unwrap();
+            let words: usize = fields[10].parse().unwrap();
+            assert_eq!(world.team_build_choice(0, 1), (expected >= 0).then_some(expected as u16), "{line}");
+            assert_eq!(world.campaign_random_state().unwrap().indices(), (words, 103 + words), "{line}");
+            count += 1;
+        }
+        assert_eq!(count, 72);
+    }
+
+    #[test]
+    fn campaign_production_fallback_keeps_lower_demand_suffix_and_native_single_candidate_consumption() {
+        let mut world = production_choice_world(&[2, 1, 3, 1], &[1, 8, 7, 6], 0, true);
+        // The seed0 CPU oracle's first word warms the stream; the third word's
+        // low bit chooses the suffix's last entry, whose demand is only one.
+        world.scenario_random_range(0, 1);
+        assert_eq!(world.team_build_choice(0, 1), Some(3));
+        assert_eq!(world.campaign_random_state().unwrap().indices(), (3, 106));
+        let saved = world.snapshot();
+        let mut restored = production_choice_world(&[2, 1, 3, 1], &[1, 8, 7, 6], 0, true);
+        restored.restore(&saved).unwrap();
+        for _ in 0..12 {
+            assert_eq!(world.team_build_choice(0, 1), restored.team_build_choice(0, 1));
+            assert_eq!(world.state_hash(), restored.state_hash());
+        }
+        let mut one = production_choice_world(&[1], &[4], 0, true);
+        assert_eq!(one.team_build_choice(0, 1), Some(0));
+        assert_eq!(one.campaign_random_state().unwrap().indices(), (1, 104), "Range(0,0) on the fallback adds no native word");
+        let mut earliest = production_choice_world(&[2, 1, 3, 1], &[1, 8, 7, 6], 100, true);
+        assert_eq!(earliest.team_build_choice(0, 1), Some(0), "earliest is independent of fallback resets");
+        assert_eq!(earliest.campaign_random_state().unwrap().indices(), (1, 104));
+        let mut legacy = production_choice_world(&[2, 1, 3, 1], &[1, 8, 7, 6], 0, false);
+        assert_eq!(legacy.team_build_choice(0, 1), Some(0), "None/skirmish retains its original earliest-only behavior");
+    }
+
+    #[test]
+    fn native_production_uses_recovered_startup_rounding_after_cost() {
+        let mut world = production_choice_world(&[2, 1, 3, 1], &[1, 8, 7, 6], 100, true);
+        // A valid serialized native state with a controlled next word, just
+        // as the original tail CPU oracle controls Range's return value.
+        control_production_words(&mut world, &[0x7fff_fffe]);
+        assert_eq!(world.team_build_choice(0, 1), Some(0), "PC53/chop selects earliest here; PC53/nearest would choose fallback type2");
+        assert_eq!(world.campaign_random_state().unwrap().indices(), (1, 104));
+        assert!(world.mission_state.as_ref().unwrap().diagnostics.iter().all(|entry| !matches!(&entry.kind, crate::mission::DiagnosticKind::CampaignAiUnverified { feature, .. } if feature == "ProductionProbabilityPrecision:1")));
+        assert_ne!(crate::production_probability::earliest_at_control_word(50, 1_073_741_823, 0x037f), crate::production_probability::earliest_at_control_word(50, 1_073_741_823, 0x027f));
+        assert_eq!(crate::production_probability::earliest_in_campaign(50, 1_073_741_823), true);
+    }
+
     #[test]
     fn yr_third_ai_triggers_do_not_run_for_allied_or_soviet_houses() {
         let mut world = World::new(Map::new(1, 1), None);
@@ -31,10 +130,59 @@ mod yr_tests {
         world.team_data.triggers[0].side = 0;
         assert!((0..3).all(|house| world.trigger_eligible(0, house, None, false, &[])));
     }
+
+    #[test]
+    fn campaign_triggers_ignore_skirmish_flag_but_honor_difficulty_enabled_and_global_switches() {
+        let mut world = World::new(Map::new(1, 1), None);
+        world.houses = vec![House { tech_level: 10, ai: Some(crate::ai::Brain::for_campaign(1, crate::ai::CampaignState::default())), ..House::default() }];
+        world.team_data.task_forces.push(Vec::new());
+        world.team_data.team_types.push(TeamType { base_defense: true, max: 10, ..TeamType::default() });
+        world.team_data.triggers.push(Trigger { team1: Some(0), team2: None, owner: Some(None), condition: -1, object: None, operand: 0, operator: 0, weight: 1.0, min_weight: 1.0, max_weight: 1.0, skirmish: false, side: 0, enabled: [true; 3], successes: 0, completed: 0 });
+        assert!(world.trigger_eligible(0, 0, None, false, &[]));
+        world.team_data.triggers[0].skirmish = true;
+        assert!(world.trigger_eligible(0, 0, None, false, &[]));
+        world.team_data.triggers[0].enabled[1] = false;
+        assert!(!world.trigger_eligible(0, 0, None, false, &[]));
+        world.team_data.triggers[0].enabled[1] = true;
+        world.mission_data = Some(crate::mission::MissionData { disabled_ai_triggers: vec![0], ..crate::mission::MissionData::default() });
+        assert!(!world.trigger_eligible(0, 0, None, false, &[]));
+        let data = world.mission_data.as_mut().unwrap();
+        data.disabled_ai_triggers.clear();
+        data.global_ai_triggers.push(0);
+        data.ignore_global_ai_triggers = true;
+        assert!(!world.trigger_eligible(0, 0, None, false, &[]));
+        world.mission_data.as_mut().unwrap().ignore_global_ai_triggers = false;
+        assert!(world.trigger_eligible(0, 0, None, false, &[]));
+        world.houses[0].ai.as_mut().unwrap().campaign = None;
+        world.team_data.triggers[0].skirmish = false;
+        assert!(!world.trigger_eligible(0, 0, None, false, &[]));
+    }
+
+    #[test]
+    fn campaign_defense_pair_differs_by_edition_and_max_counts_other_houses() {
+        let mut world = World::new(Map::new(1, 1), None);
+        world.houses = vec![House { tech_level: 10, ai: Some(crate::ai::Brain::for_campaign(1, crate::ai::CampaignState::default())), ..House::default() }, House::default()];
+        world.team_data.task_forces.push(Vec::new());
+        world.team_data.team_types.push(TeamType { max: 10, ..TeamType::default() });
+        world.team_data.team_types.push(TeamType { base_defense: true, max: 10, ..TeamType::default() });
+        world.team_data.triggers.push(Trigger { team1: Some(0), team2: Some(1), owner: Some(None), condition: -1, object: None,
+            operand: 0, operator: 0, weight: 1.0, min_weight: 1.0, max_weight: 1.0, skirmish: true, side: 0, enabled: [true; 3], successes: 0, completed: 0 });
+        world.mission_data = Some(crate::mission::MissionData::default());
+        assert!(!world.trigger_eligible(0, 0, None, false, &[]), "RA2 requires both teams to be defensive");
+        world.mission_data.as_mut().unwrap().yuri = true;
+        assert!(world.trigger_eligible(0, 0, None, false, &[]), "YR accepts either defensive team");
+        world.team_data.triggers[0].team2 = None;
+        world.team_data.team_types[0].base_defense = true;
+        world.team_data.team_types[0].max = 1;
+        world.teams.push(Team::new(10, 0, 1, 0));
+        assert!(!world.trigger_eligible(0, 0, None, false, &[]), "campaign Max is global for the TeamType");
+        world.houses[0].ai.as_mut().unwrap().campaign = None;
+        assert!(world.trigger_eligible(0, 0, None, false, &[]), "skirmish retains its per-house count");
+    }
 }
 
 /// What an AI trigger counts: a building type or a unit type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Thing {
     Building(u16),
     Unit(u16),
@@ -50,7 +198,7 @@ pub struct Score {
 }
 
 /// An `[AITriggerTypes]` entry.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Trigger {
     pub team1: Option<usize>,
     pub team2: Option<usize>,
@@ -72,7 +220,7 @@ pub struct Trigger {
 }
 
 /// A `[TeamTypes]` entry.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct TeamType {
     pub name: String,
     pub max: i32,
@@ -104,6 +252,8 @@ pub struct Data {
     pub scripts: Vec<Vec<(i32, i32)>>,
     /// By difficulty, hardest first.
     pub team_delays: [u32; 3],
+    /// `FillEarliestTeamProbability`, by difficulty, hardest first.
+    pub fill_earliest_probability: [i32; 3],
     pub min_defensive: [i32; 3],
     pub max_defensive: [i32; 3],
     pub team_cap: [i32; 3],
@@ -131,6 +281,7 @@ impl Default for Data {
             task_forces: Vec::new(),
             scripts: Vec::new(),
             team_delays: [2000, 2500, 3500],
+            fill_earliest_probability: [100; 3],
             min_defensive: [1; 3],
             max_defensive: [2; 3],
             team_cap: [30; 3],
@@ -161,6 +312,13 @@ pub struct Team {
     /// Its members, the newest first.
     pub members: Vec<u32>,
     pub created: u64,
+    /// Original map TeamType ID for a team created by a mission action. None
+    /// retains the existing skirmish script behavior.
+    pub mission_type: Option<String>,
+    /// The original TeamType waypoint is also the recruitment distance origin.
+    pub scenario_waypoint: Option<(i32, i32)>,
+    /// Runtime mission Tag instance created by this Team constructor.
+    pub scenario_tag: Option<usize>,
     zone: Option<(i32, i32)>,
     pub target: Option<Aim>,
     focus: Option<Aim>,
@@ -171,6 +329,9 @@ pub struct Team {
     reforming: bool,
     dirty: bool,
     pub moving: bool,
+    /// Original IsLeavingMap: an exiting delivery aircraft can mark the
+    /// passenger Team before its last off-map members are destroyed.
+    pub(crate) leaving_map: bool,
     pub(crate) next_mission: bool,
     success: bool,
 }
@@ -184,6 +345,9 @@ impl Team {
             line: -1,
             members: Vec::new(),
             created,
+            mission_type: None,
+            scenario_waypoint: None,
+            scenario_tag: None,
             zone: None,
             target: None,
             focus: None,
@@ -194,6 +358,7 @@ impl Team {
             reforming: false,
             dirty: true,
             moving: false,
+            leaving_map: false,
             next_mission: true,
             success: false,
         }
@@ -260,6 +425,7 @@ impl World {
     // The angriest entry above nothing whose house
     // is still in the game and no ally; the earlier house on a tie.
     pub(crate) fn adjust_anger(&mut self, house: u8, delta: i32, at: u8) {
+        if self.adjust_campaign_anger(house, delta, at) { return; }
         let count = self.houses.len();
         let Some(mut brain) = self.houses.get(house as usize).and_then(|h| h.ai.clone()) else {
             return;
@@ -371,7 +537,7 @@ impl World {
                     .and_then(|m| self.weapons.get(m.weapon as usize))
                     .and_then(|w| self.warheads.get(w.warhead as usize))
                     .is_some_and(|w| w.verses[armour] != 0.0);
-                if !(free && unit.recruitable && fighter.primary.is_some() && hurts && unit.health > 0) {
+                if !(free && unit.recruitable && self.unit_mission_recruitable(unit.id) && fighter.primary.is_some() && hurts && unit.health > 0) {
                     continue;
                 }
                 let r = rating(self, &unit);
@@ -435,7 +601,7 @@ impl World {
         if self.tick < brain.expert_at {
             return;
         }
-        if brain.enemy.is_none() && self.houses[h].base_centre != (0, 0) {
+        if self.mission_data.is_none() && brain.campaign.is_none() && brain.enemy.is_none() && self.houses[h].base_centre != (0, 0) {
             let mine = self.houses[h].base_centre;
             // Not original behaviour: the neutral house (0) stands for every
             // passive one, and houses with no base yet are skipped.
@@ -446,11 +612,26 @@ impl World {
                 self.adjust_anger(house, 1, other);
             }
         }
-        if let Some(enemy) = self.houses[h].ai.as_ref().and_then(|b| b.enemy) {
-            if self.defeated(enemy) {
+        if let Some(enemy) = self.enemy_house(house) {
+            let defeated = if self.mission_data.is_some() { self.houses[enemy as usize].defeated } else { self.defeated(enemy) };
+            if defeated {
                 let anger = self.houses[h].ai.as_ref().and_then(|b| b.anger.get(enemy as usize).copied()).unwrap_or(0);
-                self.adjust_anger(house, -anger, enemy);
+                let reset = if self.mission_data.is_some() { anger.wrapping_neg() } else { -anger };
+                self.adjust_anger(house, reset, enemy);
             }
+        }
+        if let Some(control) = brain.campaign.as_ref() {
+            // Campaign IQ does not authorize the skirmish economic recovery
+            // strategy to sell authored scenery. Unit/team/base-node work is
+            // performed by the campaign production path.
+            if control.iq >= self.campaign_iq_rules().super_weapons {
+                self.super_weapon_ai(house);
+            }
+            let wait = self.scenario_random_range(1, 7) as u32 + 105;
+            if let Some(brain) = self.houses[h].ai.as_mut() {
+                brain.expert_at = self.tick + wait as u64;
+            }
+            return;
         }
         // A
         // house that still has buildings, none of them a factory of any kind,
@@ -471,7 +652,7 @@ impl World {
             self.raise_money(house);
         }
         self.super_weapon_ai(house);
-        let wait = self.random_below(7) + 1 + 105;
+        let wait = self.scenario_random_range(1, 7) as u32 + 105;
         if let Some(brain) = self.houses[h].ai.as_mut() {
             brain.expert_at = self.tick + wait as u64;
         }
@@ -557,7 +738,7 @@ impl World {
 
     /// The harvester a house's country builds, and the refinery it would build.
     fn economy_types(&self, house: u8) -> (Option<u16>, Option<u16>) {
-        let bit = 1u32 << self.houses[house as usize].country.min(31);
+        let bit = 1u32 << self.houses[house as usize].production_country().min(31);
         let harvester = self.ai_rules.harvesters.iter().copied().find(|&unit| self.unit_types.get(unit as usize).is_some_and(|t| t.owners & bit != 0));
         let refinery = self.ai_rules.build_refinery.iter().copied().find(|&kind| self.building_types.get(kind as usize).is_some_and(|t| t.owners & bit != 0));
         (harvester, refinery)
@@ -696,7 +877,7 @@ impl World {
     // without a target is sent against the nearest thing of its house's enemy
     // (or of anyone else), again each time the house takes stock.
     fn all_to_hunt(&mut self, house: u8) {
-        let enemy = self.houses[house as usize].ai.as_ref().and_then(|b| b.enemy);
+        let enemy = self.enemy_house(house);
         let hunters: Vec<(u32, (i32, i32))> = self
             .units
             .iter()
@@ -819,8 +1000,11 @@ impl World {
             return false;
         };
         let brain_difficulty = self.houses[house as usize].ai.as_ref().map_or(2, |b| b.difficulty).min(2);
+        let campaign = self.houses[house as usize].ai.as_ref().is_some_and(|brain| brain.campaign.is_some());
         let is_def = |kind: Option<usize>| kind.and_then(|k| data.team_types.get(k)).is_some_and(|t| t.base_defense);
-        let defensive = is_def(Some(team1)) && (trigger.team2.is_none() || is_def(trigger.team2));
+        let yuri = campaign && self.mission_data.as_ref().is_some_and(|data| data.yuri);
+        let defensive = if yuri { is_def(Some(team1)) || is_def(trigger.team2) }
+            else { is_def(Some(team1)) && (trigger.team2.is_none() || is_def(trigger.team2)) };
         let have = self.teams.iter().filter(|t| t.house == house && data.team_types.get(t.kind).is_some_and(|k| k.base_defense)).count() as i32;
         let need_defense = enemy.is_none() || (data.use_min_defense && have < data.min_defensive[brain_difficulty]);
         if need_defense {
@@ -831,7 +1015,11 @@ impl World {
             return false;
         }
         // Difficulty 0 is the hardest: it needs the "hard" flag.
-        if !trigger.skirmish || !trigger.enabled[2 - brain_difficulty] {
+        if (!campaign && !trigger.skirmish) || !trigger.enabled[2 - brain_difficulty] {
+            return false;
+        }
+        if campaign && self.mission_data.as_ref().is_some_and(|data| data.disabled_ai_triggers.contains(&index)
+            || (data.ignore_global_ai_triggers && data.global_ai_triggers.contains(&index))) {
             return false;
         }
         let owner = &self.houses[house as usize];
@@ -885,7 +1073,8 @@ impl World {
                 return false;
             }
             let max = data.team_types.get(kind).map_or(-1, |t| t.max);
-            if max >= 0 && self.count_teams(house, kind) >= max {
+            let count = if campaign { self.teams.iter().filter(|team| team.kind == kind).count() as i32 } else { self.count_teams(house, kind) };
+            if max >= 0 && count >= max {
                 return false;
             }
         }
@@ -915,9 +1104,11 @@ impl World {
         if let Some(brain) = self.houses[h].ai.as_mut() {
             brain.team_timer = self.tick + delay;
         }
-        let roll = self.random_below(100) + 1;
+        let roll = self.scenario_random_range(1, 100) as u32;
         let mut out: Vec<usize> = Vec::new();
-        if roll <= 100 && brain.triggers_active {
+        let campaign = brain.campaign.is_some();
+        let ratio = if campaign { brain.trigger_ratio } else { 100 };
+        if roll as i32 <= ratio && brain.triggers_active {
             let is_def = |world: &World, team: &Team| world.team_data.team_types.get(team.kind).is_some_and(|t| t.base_defense);
             let mut total = self.teams.iter().filter(|t| t.house == house).count() as i32;
             let defensive = self.teams.iter().filter(|t| t.house == house && is_def(self, t)).count() as i32;
@@ -939,7 +1130,7 @@ impl World {
                 let mut candidates: Vec<(usize, i32)> = Vec::new();
                 let (mut sum, mut infinite) = (0, false);
                 for index in 0..self.team_data.triggers.len() {
-                    if !self.trigger_eligible(index, house, brain.enemy, no_defense, &buildable) {
+                    if !self.trigger_eligible(index, house, self.enemy_house(house), no_defense, &buildable) {
                         continue;
                     }
                     let weight = self.trigger_scores[index].weight as i32;
@@ -956,7 +1147,7 @@ impl World {
                     sum += weight;
                 }
                 if sum >= 1 && !candidates.is_empty() {
-                    let pick = self.random_below(sum as u32) as i32 + 1;
+                    let pick = self.scenario_random_range(1, sum);
                     let mut acc = 0;
                     for (index, weight) in candidates {
                         acc += weight;
@@ -975,16 +1166,33 @@ impl World {
             return;
         }
         for kind in out {
-            if let Some(team) = self.team_data.team_types.get_mut(kind) {
-                team.autocreate = true;
+            if !self.houses[house as usize].ai.as_ref().is_some_and(|brain| brain.campaign.is_some()) {
+                if let Some(team) = self.team_data.team_types.get_mut(kind) {
+                    team.autocreate = true;
+                }
+            } else if let Some(state) = self.mission_state.as_mut() {
+                if !state.autocreate_team_types.contains(&kind) {
+                    state.autocreate_team_types.push(kind);
+                }
             }
             let max = self.team_data.team_types.get(kind).map_or(-1, |t| t.max);
-            if max >= 0 && self.count_teams(house, kind) >= max {
+            let count = if campaign { self.teams.iter().filter(|team| team.kind == kind).count() as i32 } else { self.count_teams(house, kind) };
+            if max >= 0 && count >= max {
                 continue;
             }
             let id = self.next_id;
             self.next_id += 1;
-            self.teams.push(Team::new(id, kind, house, self.tick));
+            let mut team = Team::new(id, kind, house, self.tick);
+            if self.houses[house as usize].ai.as_ref().is_some_and(|brain| brain.campaign.is_some()) {
+                if let Some(data) = self.mission_data.as_ref() {
+                    team.mission_type = data.team_types.iter().find(|(_, index)| *index == kind).map(|(id, _)| id.clone());
+                    team.scenario_waypoint = data.team_definitions.iter().find(|definition| definition.kind == kind)
+                        .and_then(|definition| definition.waypoint)
+                        .and_then(|waypoint| data.waypoints.iter().find(|(id, _)| *id == waypoint)).map(|(_, cell)| *cell);
+                }
+            }
+            self.teams.push(team);
+            self.initialize_campaign_team_tag(id);
         }
     }
 
@@ -996,13 +1204,22 @@ impl World {
     }
 
     /// Ends a team: its members are free again and its triggers are scored.
-    fn delete_team(&mut self, id: u32) {
+    pub(crate) fn delete_team(&mut self, id: u32) {
         let Some(at) = self.teams.iter().position(|t| t.id == id) else {
             return;
         };
+        let releases: Vec<_> = if self.mission_data.is_some() {
+            self.teams[at].members.iter().filter_map(|&member| self.registered_unit(member)).filter(|unit| unit.team == Some(id)).map(|unit| (unit.id, unit.owner)).collect()
+        } else { self.units.iter().filter(|unit| unit.team == Some(id)).map(|unit| (unit.id, unit.owner)).collect() };
+        for (unit, owner) in releases { self.liberate_campaign_tag(id, unit, owner); }
         let team = self.teams.remove(at);
-        for unit in self.units.iter_mut().filter(|u| u.team == Some(id)) {
-            unit.team = None;
+        self.destroy_empty_team_tag(team.scenario_tag);
+        if self.mission_data.is_some() {
+            for member in &team.members {
+                if let Some(unit) = self.registered_unit_mut(*member).filter(|unit| unit.team == Some(id)) { unit.team = None; }
+            }
+        } else {
+            for unit in self.units.iter_mut().filter(|u| u.team == Some(id)) { unit.team = None; }
         }
         self.start_scores();
         let data = &self.team_data;
@@ -1047,7 +1264,7 @@ impl World {
                 if self.unit_types.get(unit as usize).is_none_or(|t| Self::class_of(&t.stats) != class) {
                     continue;
                 }
-                let held = team.members.iter().filter(|&&id| self.unit(id).is_some_and(|u| u.stats.kind == unit + 1)).count() as i32;
+                let held = self.held(team, unit) as i32;
                 let missing = count as i32 - held;
                 if missing <= 0 {
                     continue;
@@ -1071,25 +1288,75 @@ impl World {
         needs
     }
 
-    /// The unit type the house should build next of a class (0 soldiers, 1
-    /// vehicles, 2 aircraft) for its teams: a missing member of the oldest
-    /// unfilled team, the lowest type first.
-    // With the stock
-    // `FillEarliestTeamProbability` of 100; the random number is drawn anyway.
+    /// The unit type requested for missing Team members, class0 Infantry,
+    /// 1 vehicles or2 aircraft. Campaign selection keeps the original Array
+    /// order, independent earliest candidate and unusual fallback suffix.
     pub(crate) fn team_build_choice(&mut self, house: u8, class: u8) -> Option<u16> {
         let buildable = self.buildable_units(house);
         let credits = self.houses[house as usize].credits;
         let mut needs = self.team_needs(house, class);
         needs.retain(|need| buildable.contains(&need.0) && self.unit_types.get(need.0 as usize).is_some_and(|t| t.cost <= credits));
         needs.sort_by_key(|need| need.0);
-        self.random_below(0x7fff_ffff);
+        let draw = self.scenario_random_range(0, 0x7fff_fffe);
         let mut pick: Option<(u16, u64)> = None;
-        for (unit, _, created) in needs {
+        let mut maximum = 0;
+        let mut fallback = Vec::new();
+        for (unit, missing, created) in needs {
+            if missing > maximum { maximum = missing; fallback.clear(); }
+            fallback.push(unit);
             if pick.is_none_or(|(_, earliest)| created < earliest) {
                 pick = Some((unit, created));
             }
         }
-        pick.map(|(unit, _)| unit)
+        if self.mission_data.is_none() { return pick.map(|(unit, _)| unit); }
+        let difficulty = self.houses[house as usize].ai.as_ref().map_or(1, |brain| brain.difficulty.min(2));
+        let probability = self.team_data.fill_earliest_probability[difficulty];
+        let earliest = crate::production_probability::earliest_in_campaign(probability, draw);
+        if earliest { pick.map(|(unit, _)| unit) }
+        else if fallback.is_empty() { None }
+        else { Some(fallback[self.scenario_random_range(0, fallback.len() as i32 - 1) as usize]) }
+    }
+
+    /// Fly's Mission4 exit destroys the remaining native passenger chain;
+    /// this is UnInit/LiberateMember, not RegisterDestruction (7/48).
+    pub(crate) fn discard_campaign_aircraft_cargo(&mut self, index: usize) {
+        let aircraft = self.units[index].id;
+        loop {
+            let Some(index) = self.units.iter().position(|unit| unit.id == aircraft) else { break; };
+            let Some(passenger) = self.units[index].cargo.last() else { break; };
+            let (id, owner, team) = (passenger.id, passenger.owner, passenger.team);
+            if let Some(team_id) = team {
+                if let Some(team) = self.teams.iter_mut().find(|entry| entry.id == team_id) { team.leaving_map = true; }
+                self.liberate_campaign_tag(team_id, id, owner);
+                let remove = if let Some(team) = self.teams.iter_mut().find(|entry| entry.id == team_id) {
+                    team.members.retain(|&member| member != id);
+                    team.dirty = true;
+                    team.has_been && team.members.is_empty()
+                } else { false };
+                self.units[index].cargo.last_mut().unwrap().team = None;
+                if remove {
+                    // Keep the dying off-map object in the registered set
+                    // through synchronous Notice, then finish its UnInit.
+                    self.register_mission_team_exit(true);
+                    self.delete_team(team_id);
+                }
+            }
+            if let Some(index) = self.units.iter().position(|unit| unit.id == aircraft) {
+                if self.units[index].cargo.last().is_some_and(|unit| unit.id == id) { self.units[index].cargo.pop(); }
+            }
+            self.clear_unit_mission(id);
+        }
+    }
+
+    /// Foot.SetOwningHouse liberates from a Team only for a new native human
+    /// owner. Its Tag stays attached on this human path. Return an empty
+    /// previously-active Team so the action can notify before deleting it.
+    pub(crate) fn release_member_to_human_owner(&mut self, id: u32) -> Option<(u32, Option<usize>, bool)> {
+        let team_id = self.units.iter_mut().find(|unit| unit.id == id)?.team.take()?;
+        let team = self.teams.iter_mut().find(|team| team.id == team_id)?;
+        team.members.retain(|&member| member != id);
+        team.dirty = true;
+        (team.has_been && team.members.is_empty()).then_some((team_id, team.scenario_tag, team.leaving_map))
     }
 
     // --------------------------------------------------------------- members
@@ -1104,6 +1371,7 @@ impl World {
         !unit.tethered
             && unit.health > 0
             && unit.recruitable
+            && self.unit_mission_recruitable(unit.id)
             && unit.work.job == crate::Job::Idle
             && unit.capture.is_none()
             && unit.boarding.is_none()
@@ -1117,18 +1385,26 @@ impl World {
             return false;
         };
         let flies = unit.plane.is_some();
+        let autocreate = kind.autocreate || self.mission_state.as_ref().is_some_and(|state| state.autocreate_team_types.contains(&team.kind));
+        let campaign = team.mission_type.as_ref().and_then(|_| self.mission_data.as_ref())
+            .and_then(|data| data.team_definitions.iter().find(|definition| definition.kind == team.kind));
+        let group_matches = campaign.is_none_or(|definition| definition.group == -2 || definition.group == self.scenario_unit_group(unit.id) || kind.recruiter);
         unit.owner == team.house
             && unit.stats.kind == slot_unit + 1
             && !team.members.contains(&unit.id)
             && unit.health > 0
+            && group_matches
             && (self.recruit_ready(unit) || (flies && unit.recruitable))
-            && (unit.recruitable || !kind.autocreate || flies)
+            && (unit.recruitable || !autocreate || flies)
             && unit.team.is_none_or(|other| self.team_type_of(other).is_some_and(|t| t.priority < kind.priority))
             && !(flies && unit.stats.fighter.primary.is_some() && unit.plane.is_some_and(|plane| plane.ammo <= 0))
     }
 
     fn held(&self, team: &Team, unit: u16) -> u32 {
-        team.members.iter().filter(|&&id| self.unit(id).is_some_and(|u| u.stats.kind == unit + 1)).count() as u32
+        team.members.iter().filter(|&&id| {
+            let member = if self.mission_data.is_some() { self.registered_unit(id) } else { self.unit(id) };
+            member.is_some_and(|member| member.stats.kind == unit + 1)
+        }).count() as u32
     }
 
     // The nearest free unit of the type
@@ -1137,8 +1413,13 @@ impl World {
         if self.held(team, unit_kind) >= count {
             return;
         }
-        let origin = team.zone.map_or((0, 0), centre_of);
-        let best = self.units.iter().filter(|unit| self.can_add(team, unit, unit_kind)).min_by_key(|unit| distance((unit.x, unit.y), origin)).map(|unit| unit.id);
+        let origin = team.scenario_waypoint.or(team.zone).map_or((0, 0), centre_of);
+        let campaign_group = team.mission_type.as_ref().and_then(|_| self.mission_data.as_ref())
+            .and_then(|data| data.team_definitions.iter().find(|definition| definition.kind == team.kind)).map(|definition| definition.group);
+        let best = self.units.iter().filter(|unit| self.can_add(team, unit, unit_kind)).min_by_key(|unit| {
+            let penalty = campaign_group.filter(|&group| group != -2 && group != self.scenario_unit_group(unit.id)).map_or(0, |_| 0x3200);
+            distance((unit.x, unit.y), origin) + penalty
+        }).map(|unit| unit.id);
         let Some(id) = best else {
             return;
         };
@@ -1146,6 +1427,8 @@ impl World {
         let first = team.members.is_empty();
         let old = self.unit(id).and_then(|unit| unit.team);
         if let Some(old) = old {
+            let owner = self.unit(id).map_or(team.house, |unit| unit.owner);
+            self.liberate_campaign_tag(old, id, owner);
             if let Some(other) = self.teams.iter_mut().find(|t| t.id == old) {
                 other.members.retain(|&member| member != id);
                 other.dirty = true;
@@ -1158,7 +1441,15 @@ impl World {
             unit.arms.target = None;
             unit.arms.attacking = false;
         }
+        if let (Some(group), Some(state)) = (campaign_group, self.mission_state.as_mut()) {
+            if let Some(entry) = state.unit_groups.iter_mut().find(|entry| entry.0 == id) {
+                entry.1 = group;
+            } else {
+                state.unit_groups.push((id, group));
+            }
+        }
         team.members.insert(0, id);
+        self.attach_campaign_team_member_tag(team.id, id);
         team.dirty = true;
         if team.zone.is_none() {
             self.calc_centre(team);
@@ -1365,7 +1656,7 @@ impl World {
         let start = (toward + 3) & 7;
         let others = self.others();
         let open = |cell: (i32, i32)| {
-            self.map.in_playfield(cell.0, cell.1) && crate::entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), &others, &self.buildings, unit, cell, None, cell, -1) == crate::path::code::OK
+            self.map.in_playfield(cell.0, cell.1) && crate::entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, unit, cell, None, cell, -1) == crate::path::code::OK
         };
         for r in min..max {
             let mut at = (to.0 + DIRECTIONS[start].0 * r, to.1 + DIRECTIONS[start].1 * r);
@@ -1467,11 +1758,11 @@ impl World {
     /// What a team's leader would most like to attack, of a category.
     // The whole
     // map is searched; the rejections kept are those that can arise here.
-    fn team_threat(&self, leader: u32, quarry: i32, only_enemy: bool) -> Option<Aim> {
+    pub(crate) fn team_threat(&self, leader: u32, quarry: i32, only_enemy: bool) -> Option<Aim> {
         let me = self.unit(leader)?;
         let fighter = me.stats.fighter;
         let house = me.owner;
-        let enemy = self.houses[house as usize].ai.as_ref().and_then(|b| b.enemy);
+        let enemy = self.enemy_house(house);
         let mut mask: u32 = match quarry {
             2 => 0x20,
             3 => 0x40,
@@ -1633,7 +1924,7 @@ impl World {
     // nothing, so the two threat rules take the first found.
     fn find_building(&self, leader: u32, kind: u16, mode: i32, own: bool, only_enemy: bool) -> Option<u32> {
         let me = self.unit(leader)?;
-        let enemy = self.houses[me.owner as usize].ai.as_ref().and_then(|b| b.enemy);
+        let enemy = self.enemy_house(me.owner);
         let mut best: Option<(u32, i64)> = None;
         for building in self.buildings.iter().filter(|b| b.kind == kind) {
             let theirs = if own { building.owner == me.owner } else { !self.allied(me.owner, building.owner) && (!only_enemy || Some(building.owner) == enemy) };
@@ -1672,6 +1963,9 @@ impl World {
                     if let Some(slot) = self.teams.iter_mut().find(|t| t.id == id) {
                         *slot = team;
                     }
+                    if self.teams.iter().any(|team| team.id == id && team.leaving_map && team.members.is_empty()) {
+                        self.register_mission_team_exit(false);
+                    }
                     self.delete_team(id);
                 }
                 _ => {}
@@ -1684,12 +1978,16 @@ impl World {
             return false;
         };
         let force = self.team_data.task_forces.get(kind.task_force).cloned().unwrap_or_default();
-        let script = self.team_data.scripts.get(kind.script).cloned().unwrap_or_default();
+        let script = if self.mission_state.as_ref().is_some_and(|state| state.default_script_overrides.contains(&kind.script)) {
+            vec![(5, 0)]
+        } else { self.team_data.scripts.get(kind.script).cloned().unwrap_or_default() };
         // Members that have died or been taken away.
         let before = team.members.len();
         // (One riding in a transport is off the map but still a member.)
         team.members.retain(|&id| {
-            self.units.iter().any(|u| (u.id == id && u.team == Some(team.id) && u.health > 0) || u.cargo.iter().any(|rider| rider.id == id && rider.team == Some(team.id)))
+            if self.mission_data.is_some() {
+                self.registered_unit(id).is_some_and(|unit| unit.team == Some(team.id) && unit.health > 0)
+            } else { self.units.iter().any(|u| (u.id == id && u.team == Some(team.id) && u.health > 0) || u.cargo.iter().any(|rider| rider.id == id && rider.team == Some(team.id))) }
         });
         if team.members.len() != before {
             team.dirty = true;
@@ -1806,10 +2104,48 @@ impl World {
             team.focus = team.target;
         }
         let (action, argument) = if first { script[team.line as usize] } else { (action, argument) };
+        // Several old skirmish script branches are partial. Campaigns must not
+        // pass an unimplemented instruction and appear to complete their task.
+        if let Some(team_type) = team.mission_type.clone() {
+            let unsupported_mission = action == 11 && crate::mission::UnitMission::from_code(argument).is_none();
+            if argument == i32::MIN || unsupported_mission || !matches!(action, 0 | 1 | 3 | 4 | 5 | 6 | 8 | 11 | 14 | 21 | 39 | 40 | 43 | 46 | 47 | 49 | 53 | 54 | 55 | 57 | 58) {
+                self.report_mission_diagnostic(Some(&team_type), crate::mission::DiagnosticKind::UnsupportedScript { team: team.id, team_type: team_type.clone(), line: team.line, opcode: action },
+                    "The campaign team is stopped at an unimplemented script instruction; the line has not been skipped.");
+                team.next_mission = false;
+                return true;
+            }
+        }
         let stray = if matches!(action, 53 | 54) { self.team_data.relaxed_stray } else { self.team_data.stray };
         let leader = self.leader(team);
         // 11: the action.
         match action {
+            39 | 40 if team.mission_type.is_some() => {
+                if !self.set_campaign_script_local(argument, action == 39) {
+                    self.report_mission_diagnostic(team.mission_type.as_deref(), crate::mission::DiagnosticKind::InvalidParameter { kind: action, index: team.line.max(0) as usize },
+                        "This script local-variable ID is outside the original fixed array. The native setter ignores it and still completes the script step.");
+                }
+                team.next_mission = true;
+            }
+            1 if team.mission_type.is_some() => {
+                let cell = self.mission_data.as_ref().and_then(|data| data.waypoints.iter().find(|(id, _)| *id == argument)).map(|(_, cell)| *cell);
+                let Some(cell) = cell else {
+                    self.report_mission_diagnostic(team.mission_type.as_deref(), crate::mission::DiagnosticKind::MissingScriptWaypoint { team: team.id, waypoint: argument },
+                        "Attack-waypoint references a missing waypoint; the team remains at this instruction.");
+                    team.next_mission = false;
+                    return true;
+                };
+                if first {
+                    team.target = self.buildings.iter().find(|building| building.health > 0 && cell.0 >= building.cell.0 && cell.1 >= building.cell.1 && cell.0 < building.cell.0 + building.size.0 && cell.1 < building.cell.1 + building.size.1)
+                        .map(|building| Aim::Building(building.id)).or(Some(Aim::Cell(cell.0, cell.1)));
+                    team.focus = team.target;
+                }
+                let spent = team.members.iter().filter_map(|&id| self.unit(id)).all(|u| u.plane.is_some_and(|plane| u.stats.plane.is_some_and(|s| s.ammo >= 1) && plane.ammo <= 0));
+                if team.target.is_none() || spent {
+                    team.next_mission = true;
+                } else {
+                    self.coordinate_attack(team, stray);
+                }
+            }
             // Attack a category of thing.
             0 => {
                 if team.target.is_none() {
@@ -1828,7 +2164,23 @@ impl World {
                 }
                 self.coordinate_attack(team, stray);
             }
-            // Move to a cell.
+            // Campaign Move to waypoint: the original helper resolves the
+            // script argument through Scenario.GetWaypoint. Script 4 below is
+            // a different instruction carrying a packed cell coordinate.
+            3 if team.mission_type.is_some() => {
+                if first {
+                    team.target = self.mission_data.as_ref().and_then(|data| data.waypoints.iter().find(|(id, _)| *id == argument)).map(|(_, cell)| Aim::Cell(cell.0, cell.1));
+                    team.focus = team.target;
+                }
+                if team.target.is_none() {
+                    self.report_mission_diagnostic(team.mission_type.as_deref(), crate::mission::DiagnosticKind::MissingScriptWaypoint { team: team.id, waypoint: argument },
+                        "The campaign team's Move-to-waypoint instruction references a missing waypoint; the team remains on that instruction.");
+                    team.next_mission = false;
+                    return true;
+                }
+                self.coordinate_move(team, stray);
+            }
+            // Move to a packed cell, in both skirmish and campaign scripts.
             4 => {
                 if first {
                     team.target = Some(Aim::Cell(argument % 128, argument / 128));
@@ -1863,8 +2215,17 @@ impl World {
                     let Some(unit) = self.unit(id) else {
                         continue;
                     };
+                    // Original DoMission(Guard) also accepts an existing
+                    // Unload mission; do not cancel transport unloading.
+                    if team.mission_type.is_some() && argument == 5 && unit.unloading.is_some() {
+                        continue;
+                    }
                     if unit.arms.target.is_none() && !Self::has_destination(unit) && distance((unit.x, unit.y), zone) > 2 * stray as i64 && argument != 11 {
                         self.send_member(id, zone);
+                    } else if team.mission_type.is_some() && unit.arms.target.is_none() && !Self::has_destination(unit) {
+                        if let Some(mission) = crate::mission::UnitMission::from_code(argument) {
+                            if self.unit_mission(id) != Some(mission) { self.assign_unit_mission(id, mission); }
+                        }
                     }
                 }
             }
@@ -1919,7 +2280,7 @@ impl World {
                         return true;
                     };
                     let mine = self.houses[owner as usize].base_centre;
-                    let enemy = self.houses[owner as usize].ai.as_ref().and_then(|b| b.enemy).map(|enemy| self.houses[enemy as usize].base_centre).filter(|&centre| centre != (0, 0));
+                    let enemy = self.enemy_house(owner).map(|enemy| self.houses[enemy as usize].base_centre).filter(|&centre| centre != (0, 0));
                     let (from, towards) = match (action, enemy) {
                         (53, Some(enemy)) => (enemy, mine),
                         (53, None) => {
@@ -2002,6 +2363,7 @@ impl World {
                     let back = if carrier && kind.transports_return { self.units.iter_mut().find(|u| u.id == id).map(|u| u.work.archive.take()) } else { None };
                     let goes = back.is_some() || if carrier { matches!(argument, 2 | 3) } else { matches!(argument, 1 | 3) };
                     if goes {
+                        if let Some(owner) = self.unit(id).map(|unit| unit.owner) { self.liberate_campaign_tag(team.id, id, owner); }
                         team.members.retain(|&member| member != id);
                         if let Some(unit) = self.units.iter_mut().find(|u| u.id == id) {
                             unit.team = None;
@@ -2065,6 +2427,69 @@ impl World {
 }
 
 impl World {
+    /// Allocate an empty team and its script state. This is the constructor,
+    /// without AI selection policy or a TeamType.Max check. Mission action 4
+    /// explicitly bypasses that limit in both original executables. Recruitment
+    /// is performed later by run_teams, never by spawning units here.
+    pub fn create_team(&mut self, house: u8, kind: usize) -> Result<u32, String> {
+        if house as usize >= self.houses.len() { return Err(format!("team house {house} is not initialized")); }
+        let definition = self.team_data.team_types.get(kind).ok_or_else(|| format!("missing team type {kind}"))?;
+        let force = self.team_data.task_forces.get(definition.task_force).ok_or_else(|| format!("team type {kind} has no task force"))?;
+        if self.team_data.scripts.get(definition.script).is_none() { return Err(format!("team type {kind} has no script")); }
+        if force.iter().any(|(_, unit)| *unit as usize >= self.unit_types.len()) { return Err(format!("team type {kind} contains an unknown unit type")); }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.teams.push(Team::new(id, kind, house, self.tick));
+        self.initialize_campaign_team_tag(id);
+        Ok(id)
+    }
+
+    /// Reinforcement construction uses the direct Team constructor and starts
+    /// forced active; it does not use the AI selector's Max gate or recruit.
+    pub(crate) fn create_reinforcement_team(&mut self, house: u8, kind: usize, original: &str, waypoint: (i32, i32)) -> Result<u32, String> {
+        let id = self.create_team(house, kind)?;
+        let team = self.teams.iter_mut().find(|team| team.id == id).expect("new reinforcement team");
+        team.mission_type = Some(original.into());
+        team.scenario_waypoint = Some(waypoint);
+        team.moving = true;
+        team.under = false;
+        team.has_been = true;
+        Ok(id)
+    }
+
+    pub(crate) fn initialize_reinforcement_member(&mut self, team_id: u32, unit: &mut Unit) {
+        let team = self.teams.iter_mut().find(|team| team.id == team_id).expect("reinforcement team");
+        unit.team = Some(team_id);
+        unit.initiated = true;
+        unit.recruitable = self.team_data.team_types[team.kind].members_recruitable;
+        // AddMember precedes Object.Next carrier/cargo classification and
+        // inserts at the Team chain's head in numeric construction order.
+        team.members.insert(0, unit.id);
+        team.dirty = true;
+    }
+
+    /// Run one original-style recruitment pass: at most one member for each
+    /// task-force slot. Normal simulation ticks call the same private recruit
+    /// routine while a team is forming.
+    pub fn recruit_team(&mut self, id: u32) -> Result<usize, String> {
+        let index = self.teams.iter().position(|team| team.id == id).ok_or_else(|| format!("missing team {id}"))?;
+        let mut team = self.teams[index].clone();
+        let definition = self.team_data.team_types.get(team.kind).ok_or_else(|| format!("missing team type {}", team.kind))?;
+        let force = self.team_data.task_forces.get(definition.task_force).cloned().ok_or_else(|| format!("missing task force {}", definition.task_force))?;
+        let before = team.members.len();
+        for (count, kind) in force { self.recruit(&mut team, kind, count); }
+        let joined = team.members.len() - before;
+        self.teams[index] = team;
+        Ok(joined)
+    }
+
+    fn scenario_unit_group(&self, id: u32) -> i32 {
+        if let Some((_, group)) = self.mission_state.as_ref().and_then(|state| state.unit_groups.iter().find(|entry| entry.0 == id)) {
+            return *group;
+        }
+        self.mission_data.as_ref().and_then(|data| data.objects.iter().find(|binding| binding.object == Aim::Unit(id))).map_or(-1, |binding| binding.group)
+    }
+
     /// Starts a team of a type for a house, as an AI trigger would, for tests.
     #[doc(hidden)]
     pub fn start_team_for_tests(&mut self, house: u8, kind: usize) -> u32 {

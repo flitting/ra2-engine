@@ -122,11 +122,48 @@ impl Node {
     pub(crate) fn wanted(kind: u16) -> Self {
         Self { kind: Some(kind), cell: None, fails: 0, cover: None }
     }
+
+    /// An original scenario Base node, preserving its requested location.
+    pub fn planned(kind: u16, cell: (i32, i32)) -> Self {
+        Self { kind: Some(kind), cell: Some(cell), fails: 0, cover: None }
+    }
+}
+
+/// Mutable house switches used by a scripted single-player scenario.
+/// Presence selects the campaign path; None keeps the skirmish brain intact.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct CampaignState {
+    pub iq: i32,
+    pub production: bool,
+    pub autocreate: bool,
+    pub auto_base_building: bool,
+}
+
+/// `[IQ]` feature thresholds, shared by the scenario houses.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CampaignRules {
+    pub production: i32,
+    pub guard_area: i32,
+    pub repair_sell: i32,
+    pub harvester: i32,
+    pub aircraft: i32,
+    pub super_weapons: i32,
+    pub sell_back: i32,
+}
+
+impl Default for CampaignRules {
+    fn default() -> Self {
+        Self { production: 5, guard_area: 2, repair_sell: 1, harvester: 2, aircraft: 3, super_weapons: 4, sell_back: 2 }
+    }
 }
 
 /// A computer house's state.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Brain {
+    pub campaign: Option<CampaignState>,
+    /// Original House registry order, before the adapter reserves runtime 0
+    /// for Neutral. Used by the original initial team-delay staggering.
+    pub original_house_index: Option<u32>,
     /// The base plan, the yard's cell, and the building it has decided on next.
     pub nodes: Vec<Node>,
     pub base_cell: Option<(i32, i32)>,
@@ -161,6 +198,9 @@ pub struct Brain {
     pub mode: u8,
     units_stuck: bool,
     pub triggers_active: bool,
+    /// Native RatioAITriggerTeam percentage; campaigns consume the roll even
+    /// when this ratio or AITriggersActive rejects the selection.
+    pub trigger_ratio: i32,
     pub enemy: Option<u8>,
     pub anger: Vec<i32>,
     pub expert_at: u64,
@@ -185,7 +225,11 @@ const AROUND: [(i32, i32); 8] = [(0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 
 impl Brain {
     /// A computer house of a difficulty: 0 hardest to 2 easiest.
     pub fn of(difficulty: usize) -> Self {
-        Self { difficulty, ..Self::default() }
+        Self { difficulty, trigger_ratio: 100, ..Self::default() }
+    }
+
+    pub fn for_campaign(difficulty: usize, control: CampaignState) -> Self {
+        Self { campaign: Some(control), ..Self::of(difficulty) }
     }
 }
 
@@ -203,7 +247,7 @@ impl World {
         let probe = Unit::new(u32::MAX - 1, owner, cell, 0, *stats);
         let others: Vec<Other> = self.others();
         let taken = self.units.iter().any(|u| u.cell() == cell && !(u.stats.infantry && stats.infantry));
-        !taken && entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), &others, &self.buildings, &probe, cell, None, cell, -1) == code::OK
+        !taken && entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, &probe, cell, None, cell, -1) == code::OK
     }
 
     /// Puts a new unit on a cell or the nearest free one round it.
@@ -258,7 +302,7 @@ impl World {
             return;
         }
         let playing: Vec<usize> = (1..self.houses.len()).collect();
-        let mask = playing.iter().fold(0u32, |mask, &h| mask | 1 << self.houses[h].country.min(31));
+        let mask = playing.iter().fold(0u32, |mask, &h| mask | 1 << self.houses[h].production_country().min(31));
         let may_start = |kind: &crate::UnitType, countries: u32, tech: i32| {
             kind.stats.allowed_to_start && kind.owners & countries != 0 && kind.tech_level <= tech && !kind.stats.base_unit && kind.stats.plane.is_none() && !kind.stats.fighter.aircraft
         };
@@ -266,7 +310,7 @@ impl World {
         let count = (all.len() as i32).max(1);
         let budget = ((count / 2 + all.iter().sum::<i32>()) / count) * unit_count;
         for house in playing {
-            let (country, tech, centre) = (1u32 << self.houses[house].country.min(31), self.houses[house].tech_level, self.houses[house].base_centre);
+            let (country, tech, centre) = (1u32 << self.houses[house].production_country().min(31), self.houses[house].tech_level, self.houses[house].base_centre);
             let cell = (centre.0.div_euclid(LEPTONS_PER_CELL), centre.1.div_euclid(LEPTONS_PER_CELL));
             let pick = |infantry: bool, world: &World| -> Vec<usize> {
                 (0..world.unit_types.len())
@@ -302,8 +346,48 @@ impl World {
     // Houses run last.
     pub(crate) fn think(&mut self) {
         self.recalc_centres();
-        for house in 0..self.houses.len() {
+        // Campaign's runtime Neutral slot may differ from the original
+        // House.Array position. Its bindings retain source order; unbound test
+        // houses still receive their existing AI turn at the end.
+        let mut house_order: Vec<usize> = self.mission_data.as_ref().map_or_else(Vec::new, |data| data.houses.iter().map(|binding| binding.house as usize).collect());
+        for house in 0..self.houses.len() { if !house_order.contains(&house) { house_order.push(house); } }
+        for house in house_order {
             if self.houses[house].ai.is_none() {
+                self.run_house_mission_tags(house as u8);
+                continue;
+            }
+            if self.houses[house].ai.as_ref().is_some_and(|brain| brain.campaign.is_some()) {
+                let passive = self.mission_data.as_ref().is_some_and(|data| data.passive_houses.contains(&(house as u8)));
+                // Original House.AI enables these three switches before the
+                // separate passive/production dispatch gate. Campaign human
+                // is the native raw-human OR player-control union.
+                if !self.houses[house].human {
+                    let production_iq = self.campaign_iq_rules().production;
+                    if let Some(brain) = self.houses[house].ai.as_mut() {
+                        if let Some(control) = brain.campaign.as_mut() {
+                            if control.iq >= production_iq || control.auto_base_building {
+                                control.auto_base_building = true;
+                                control.production = true;
+                                control.autocreate = true;
+                            }
+                        }
+                    }
+                }
+                if !self.houses[house].human && !self.houses[house].defeated && !passive {
+                    if let Some(brain) = self.houses[house].ai.as_mut() {
+                        if let Some(control) = brain.campaign.as_ref() { brain.awake = control.production; }
+                    }
+                    if self.houses[house].ai.as_ref().and_then(|brain| brain.campaign.as_ref()).is_some_and(|control| control.auto_base_building) {
+                        self.report_mission_diagnostic(None, crate::mission::DiagnosticKind::CampaignAiUnverified { house: house as u8, feature: "AutoBaseBuilding".into() },
+                            "Authored Base nodes and team production run; automatic campaign base-plan extension has not yet been reconstructed.");
+                    }
+                    self.expert_ai(house as u8);
+                    self.team_check(house as u8);
+                    if self.mission_data.as_ref().is_none_or(|data| !data.yuri) || self.tick % 8 == 0 {
+                        self.run_campaign_production(house as u8);
+                    }
+                }
+                self.run_house_mission_tags(house as u8);
                 continue;
             }
             self.base_unit_mission(house as u8);
@@ -316,7 +400,81 @@ impl World {
             if let Some(brain) = self.houses[house].ai.as_mut() {
                 brain.awake = true;
             }
+            self.run_house_mission_tags(house as u8);
         }
+    }
+
+    pub(crate) fn campaign_iq_rules(&self) -> CampaignRules {
+        self.mission_data.as_ref().map_or_else(CampaignRules::default, |data| data.campaign_ai_rules.clone())
+    }
+
+    /// Scenario production uses its authored Base nodes and the normal team's
+    /// missing-member demand. It never synthesizes a skirmish base plan.
+    fn run_campaign_production(&mut self, house: u8) {
+        let h = house as usize;
+        let Some(mut brain) = self.houses[h].ai.clone() else { return; };
+        let Some(control) = brain.campaign.clone() else { return; };
+        // Native campaign dispatch chooses and retains the requested types
+        // even with Production=false. Only the factory's actual start is
+        // gated; an authored Action3 can later enable that cached demand.
+        if brain.build_structure.is_none() {
+            brain.build_structure = brain.nodes.iter().find(|node| !self.node_built(house, node)).and_then(|node| node.kind);
+        }
+        if let Some(kind) = brain.build_structure {
+            if let Some(cell) = brain.nodes.iter().find(|node| node.kind == Some(kind) && !self.node_built(house, node)).and_then(|node| node.cell) {
+                let combat = self.is_defence(kind);
+                match self.houses[h].slot(combat) {
+                    None if control.production && self.houses[h].credits >= 11 => {
+                        self.order(crate::Order::Build { house, building: kind });
+                        if self.houses[h].slot(combat).is_none() {
+                            self.report_mission_diagnostic(None, crate::mission::DiagnosticKind::CampaignAiUnverified { house, feature: format!("BaseNodeBuildability:{kind}") },
+                                "This authored Base node cannot start through the current factory/prerequisite rules; campaign-specific original buildability exceptions still need reconstruction.");
+                        }
+                    }
+                    Some(production) if production.is_ready() && production.building == kind && self.can_place(house, kind, cell) => {
+                        *self.houses[h].slot_mut(combat) = None;
+                        self.add_building(house, kind, cell);
+                        self.map.build_zones();
+                        brain.build_structure = None;
+                    }
+                    Some(production) if production.is_ready() && production.building == kind => {
+                        self.report_mission_diagnostic(None, crate::mission::DiagnosticKind::CampaignAiUnverified { house, feature: format!("BaseNodePlacement:{kind}") },
+                            "The completed structure's authored Base node is blocked. The current campaign path holds it; original retry and alternate-placement policy is not yet implemented.");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Team demand applies even to IQ 1 authored mission houses. IQ's
+        // Production threshold controls autonomous strategy, not Action 3's
+        // explicit Production switch.
+        self.houses[h].ai = Some(brain.clone());
+        let iq = self.campaign_iq_rules();
+        // Native Producing*TypeIndex remains selected until that object has
+        // actually left its factory, or production is abandoned. Holding it
+        // avoids drawing/choosing a second request during the current build.
+        if brain.build_unit.is_none() && control.iq >= iq.harvester {
+            let bit = 1u32 << self.houses[h].production_country().min(31);
+            if let Some(harvester) = self.ai_rules.harvesters.iter().copied().find(|&unit| self.unit_types.get(unit as usize).is_some_and(|kind| kind.owners & bit != 0)) {
+                let refineries = self.buildings.iter().filter(|building| building.owner == house && self.ai_rules.build_refinery.contains(&building.kind)).count() as i32;
+                let owned = self.units.iter().filter(|unit| unit.owner == house && unit.stats.kind == harvester + 1).count() as i32;
+                if owned < refineries * self.ai_rules.harvesters_per_refinery && !self.houses[h].no_ore {
+                    brain.build_unit = Some(harvester);
+                }
+            }
+        }
+        if brain.build_unit.is_none() { brain.build_unit = self.team_build_choice(house, 1); }
+        if brain.build_infantry.is_none() { brain.build_infantry = self.team_build_choice(house, 0); }
+        if brain.build_aircraft.is_none() { brain.build_aircraft = self.team_build_choice(house, 2); }
+        for choice in [&mut brain.build_unit, &mut brain.build_infantry, &mut brain.build_aircraft] {
+            if let Some(unit) = *choice {
+                let tab = self.unit_slot(unit);
+                if control.production && self.houses[h].tab_slot(tab).is_none() && self.houses[h].credits >= 11 {
+                    self.order(crate::Order::BuildUnit { house, unit });
+                }
+            }
+        }
+        self.finish_base_turn(h, brain);
     }
 
     /// A computer house's soldiers that deploy to fire dig in when they have
@@ -418,12 +576,13 @@ impl World {
     // `ForbiddenHouses` and `AIBasePlanningSide`.
     fn pick(&self, house: u8, list: &[u16]) -> Option<u16> {
         let h = self.houses.get(house as usize)?;
-        let bit = 1u32 << h.country.min(31);
+        let bit = 1u32 << h.production_country().min(31);
+        let identity = 1u32 << h.country.min(31);
         list.iter().copied().find(|&kind| {
             self.building_types.get(kind as usize).is_some_and(|t| {
                 t.owners & bit != 0
-                    && t.required_houses.is_none_or(|mask| mask & bit != 0)
-                    && t.forbidden_houses.is_none_or(|mask| mask & bit == 0)
+                    && t.required_houses.is_none_or(|mask| mask & identity != 0)
+                    && t.forbidden_houses.is_none_or(|mask| mask & identity == 0)
                     && (t.planning_side == -1 || t.planning_side == h.side)
             })
         })
@@ -439,7 +598,8 @@ impl World {
         let Some(h) = self.houses.get(house as usize) else {
             return Vec::new();
         };
-        let (bit, side, tech, difficulty) = (1u32 << h.country.min(31), h.side, h.tech_level, h.ai.as_ref().map_or(2, |brain| brain.difficulty));
+        let (bit, side, tech, difficulty) = (1u32 << h.production_country().min(31), h.side, h.tech_level, h.ai.as_ref().map_or(2, |brain| brain.difficulty));
+        let identity = 1u32 << h.country.min(31);
         let mut candidates: Vec<u16> = (0..self.building_types.len() as u16)
             .filter(|&kind| {
                 let t = &self.building_types[kind as usize];
@@ -447,8 +607,8 @@ impl World {
                     && (t.planning_side == side || t.planning_side == -1)
                     && t.ai_build_this
                     && t.tech_level <= tech
-                    && t.required_houses.is_none_or(|mask| mask & bit != 0)
-                    && t.forbidden_houses.is_none_or(|mask| mask & bit == 0)
+                    && t.required_houses.is_none_or(|mask| mask & identity != 0)
+                    && t.forbidden_houses.is_none_or(|mask| mask & identity == 0)
             })
             .collect();
         let mut done = vec![false; candidates.len()];
@@ -971,7 +1131,7 @@ impl World {
         // house has fewer than `HarvestersPerRefinery` for each refinery.
         let harvester_wanted = brain.build_unit;
         if brain.build_unit.is_none() {
-            let bit = 1u32 << self.houses[h].country.min(31);
+            let bit = 1u32 << self.houses[h].production_country().min(31);
             let harvester = self.ai_rules.harvesters.iter().copied().find(|&unit| self.unit_types.get(unit as usize).is_some_and(|t| t.owners & bit != 0));
             let refineries = self.buildings.iter().filter(|b| b.owner == house && self.ai_rules.build_refinery.contains(&b.kind)).count() as i32;
             if let Some(harvester) = harvester {

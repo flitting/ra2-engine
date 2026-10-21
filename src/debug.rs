@@ -21,10 +21,19 @@ impl Plugin for DebugPlugin {
             app.insert_resource(Script::parse(&script)).add_systems(PreUpdate, play_script.after(bevy::input::InputSystems));
         }
         if std::env::var_os("RA2_SHOT").is_some() {
+            if let Some(tick) = std::env::var("RA2_SHOT_TICK").ok().and_then(|n| n.parse().ok()) {
+                app.insert_resource(CaptureTick(tick));
+            }
             app.add_systems(PostStartup, draw_off_screen).add_systems(Update, (follow_window, capture_and_exit).chain());
         }
     }
 }
+
+/// Stops the offline simulation at the requested screenshot tick while the
+/// renderer finishes uploading and drawing that state. Network sessions retain
+/// their own clock and never use this limit.
+#[derive(Resource)]
+pub(crate) struct CaptureTick(pub u64);
 
 /// The picture the game is drawn into while taking a screenshot.
 #[derive(Resource)]
@@ -110,17 +119,17 @@ fn capture_and_exit(
     mut exit: MessageWriter<AppExit>,
     camera: Single<&RenderTarget, With<Camera2d>>,
     sim: Option<Res<crate::units::Sim>>,
+    wanted_tick: Option<Res<CaptureTick>>,
     mut reached: Local<Option<u32>>,
 ) {
     *frame += 1;
     // RA2_SHOT_FRAME overrides how many frames to wait before the screenshot.
     // RA2_SHOT_TICK instead waits for the simulation to reach a tick (use with
-    // RA2_SPEED to get there quickly), then a few frames more for the picture to
-    // catch up.
-    let wanted_tick: Option<u64> = std::env::var("RA2_SHOT_TICK").ok().and_then(|n| n.parse().ok());
-    let capture_frame = match wanted_tick {
+    // RA2_SPEED to get there quickly). Offline ticks remain held there while a
+    // few render frames let the picture catch up.
+    let capture_frame = match wanted_tick.map(|tick| tick.0) {
         Some(tick) => {
-            if reached.is_none() && sim.is_some_and(|sim| sim.0.current_tick() >= tick) {
+            if reached.is_none() && sim.as_ref().is_some_and(|sim| sim.0.current_tick() >= tick) {
                 *reached = Some(*frame + 5);
             }
             reached.unwrap_or(u32::MAX - EXIT_FRAME)
@@ -129,6 +138,7 @@ fn capture_and_exit(
     };
     if *frame == capture_frame {
         let path = std::env::var("RA2_SHOT").unwrap_or_default();
+        info!(simulation_tick = ?sim.as_ref().map(|sim| sim.0.current_tick()), path, "capturing screenshot");
         // The image target's DPI participates in its identity. Screenshot::image
         // assumes 1x, so preserve the camera's complete target on HiDPI screens.
         let shot = Screenshot(camera.into_inner().clone());

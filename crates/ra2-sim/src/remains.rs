@@ -438,7 +438,7 @@ impl World {
         let mut unit = Unit::new(id, owner, cell, 0, stats);
         unit.facing = 0;
         let others: Vec<Other> = self.others();
-        if entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), &others, &self.buildings, &unit, cell, None, cell, -1) != code::OK {
+        if entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, &unit, cell, None, cell, -1) != code::OK {
             return None;
         }
         let at = self.map.index(cell.0, cell.1)?;
@@ -669,7 +669,7 @@ impl World {
     /// one it can stand on; it is lost if there is none.
     fn release_parasite(&mut self, biter: Unit, cell: (i32, i32)) {
         let others: Vec<Other> = self.others();
-        let open = entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), &others, &self.buildings, &biter, cell, None, cell, -1) == code::OK;
+        let open = entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, &biter, cell, None, cell, -1) == code::OK;
         let spot = if open { Some(cell) } else { crate::nearby(&self.map, &self.claims, &self.spots, &biter, cell, crate::Near::new(false, true, Some(cell)), self.tick) };
         if let Some(spot) = spot {
             self.set_down(biter, spot);

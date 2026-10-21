@@ -26,6 +26,7 @@ use ra2_formats::shp::Shp;
 
 use crate::files::{Edition, GameFiles};
 use crate::game::GameSetup;
+use crate::campaign::{CampaignDifficulty, CampaignMetadata, CampaignSide, PendingCampaign};
 
 // The shell is laid out for at most 800x600 and the
 // sidebar is 168 px wide.
@@ -66,6 +67,7 @@ pub(crate) enum Screen {
     #[default]
     MainMenu,
     SinglePlayer,
+    NewCampaign,
     Skirmish,
     ChooseMap,
     /// Create or join a network game.
@@ -92,6 +94,8 @@ enum MenuAction {
     UseMap,
     /// Starts a game on the selected map.
     StartGame,
+    StartCampaign,
+    ContinueCampaign,
     /// Create a network game: on to the skirmish screen to set it up.
     HostGame,
     /// Join the network game at the address typed.
@@ -324,6 +328,7 @@ struct Shell {
     modes: Vec<String>,
     mode_rules: Vec<String>,
     countries: Vec<CountryChoice>,
+    campaigns: Result<CampaignMetadata, String>,
     pics: HashMap<String, Pic>,
 }
 
@@ -332,8 +337,9 @@ pub struct ShellPlugin;
 impl Plugin for ShellPlugin {
     fn build(&self, app: &mut App) {
         // RA2_SCREEN picks the screen to open on, for checking a layout directly.
-        let first = match std::env::var("RA2_SCREEN").as_deref() {
+        let mut first = match std::env::var("RA2_SCREEN").as_deref() {
             Ok("single-player") => Screen::SinglePlayer,
+            Ok("campaign") | Ok("new-campaign") => Screen::NewCampaign,
             Ok("skirmish") => Screen::Skirmish,
             Ok("choose-map") => Screen::ChooseMap,
             Ok("network") => Screen::Network,
@@ -351,8 +357,36 @@ impl Plugin for ShellPlugin {
             .ok()
             .or_else(|| shell.maps.first().map(|map| map.id.clone()))
             .unwrap_or_default();
+        let difficulty = app.world().get_resource::<crate::prefs::Prefs>().map_or(CampaignDifficulty::Normal, |prefs| CampaignDifficulty::from_preference(prefs.difficulty));
+        let mut campaign_choice = CampaignChoice { difficulty, ..default() };
+        let mut setup = GameSetup { map, map_name: String::new(), options: options_from_env(), max_players: 8, mode_rules: std::env::var("RA2_MODE").unwrap_or_else(|_| "MPBattle.ini".into()) };
+        if let Ok(side) = std::env::var("RA2_CAMPAIGN") {
+            campaign_choice.side = match side.as_str() {
+                "allied" => CampaignSide::Allied,
+                "soviet" => CampaignSide::Soviet,
+                _ => panic!("RA2_CAMPAIGN must be allied or soviet"),
+            };
+            campaign_choice.stage = std::env::var("RA2_CAMPAIGN_STAGE").ok().map(|value| value.parse::<usize>().ok().and_then(|stage| stage.checked_sub(1)).expect("RA2_CAMPAIGN_STAGE must be a positive mission number")).unwrap_or(0);
+            campaign_choice.difficulty = match std::env::var("RA2_CAMPAIGN_DIFFICULTY").as_deref() {
+                Ok("easy") => CampaignDifficulty::Easy,
+                Ok("normal") => CampaignDifficulty::Normal,
+                Ok("hard") => CampaignDifficulty::Hard,
+                Err(std::env::VarError::NotPresent) => difficulty,
+                _ => panic!("RA2_CAMPAIGN_DIFFICULTY must be easy, normal or hard"),
+            };
+            let metadata = shell.campaigns.as_ref().expect("campaign metadata");
+            let run = metadata.run(campaign_choice.side, campaign_choice.stage, campaign_choice.difficulty).expect("RA2_CAMPAIGN_STAGE is outside the installed campaign");
+            assert!(shell.files.get(&run.scenario).is_some(), "campaign scenario {} is missing", run.scenario);
+            setup.map = run.map_stem().to_owned();
+            setup.map_name = shell.string(&metadata.stage(&run).unwrap().ui_name);
+            setup.mode_rules.clear();
+            setup.max_players = 1;
+            app.insert_resource(PendingCampaign(run));
+            if first != Screen::InGame { first = Screen::LoadScreen }
+        }
         app.insert_resource(shell)
-            .insert_resource(GameSetup { map, map_name: String::new(), options: options_from_env(), max_players: 8, mode_rules: std::env::var("RA2_MODE").unwrap_or_else(|_| "MPBattle.ini".into()) })
+            .insert_resource(campaign_choice)
+            .insert_resource(setup)
             .insert_state(first)
             .init_resource::<MapChoice>()
             .insert_resource(OpenCombo(match std::env::var("RA2_COMBO").as_deref() {
@@ -367,6 +401,7 @@ impl Plugin for ShellPlugin {
             .add_systems(OnEnter(Screen::MainMenu), spawn_main_menu)
             .add_systems(OnEnter(Screen::Score), spawn_score)
             .add_systems(OnEnter(Screen::SinglePlayer), spawn_single_player)
+            .add_systems(OnEnter(Screen::NewCampaign), (spawn_new_campaign, start_slide))
             .add_systems(OnEnter(Screen::Skirmish), spawn_skirmish)
             .add_systems(OnEnter(Screen::ChooseMap), spawn_choose_map)
             .add_systems(OnEnter(Screen::Network), (spawn_network, start_slide))
@@ -405,6 +440,7 @@ impl Plugin for ShellPlugin {
             .add_observer(on_map_entry)
             .add_observer(on_mode_entry)
             .add_observer(on_save_entry);
+        app.add_observer(on_campaign_control);
     }
 }
 
@@ -476,6 +512,7 @@ impl Shell {
             .unzip();
 
         let countries = country_choices(&Ini::parse(files.get("rules.ini").expect("rules.ini")));
+        let campaigns = CampaignMetadata::load(&files);
         Self {
             files,
             font,
@@ -484,6 +521,7 @@ impl Shell {
             modes,
             mode_rules,
             countries,
+            campaigns,
             pics: HashMap::new(),
         }
     }
@@ -927,7 +965,12 @@ fn spawn_load_screen(
     mut images: ResMut<Assets<Image>>,
     setup: Res<GameSetup>,
     lobby: Res<crate::net::Lobby>,
+    campaign: Option<Res<PendingCampaign>>,
 ) {
+    if let Some(campaign) = campaign {
+        spawn_campaign_load_screen(&mut commands, &mut shell, &mut images, &campaign.0);
+        return;
+    }
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.subsec_nanos() as usize);
     let country = loading_country(&shell.countries, setup.options.country, nanos).expect("rules contain a multiplayer country");
     if setup.options.country != country as i32 {
@@ -1035,6 +1078,39 @@ fn spawn_load_screen(
         });
 }
 
+fn spawn_campaign_load_screen(commands: &mut Commands, shell: &mut Shell, images: &mut Assets<Image>, run: &crate::campaign::CampaignRun) {
+    commands.insert_resource(LoadScreenShown { frames: 0, finished: None });
+    let stage = shell.campaigns.as_ref().ok().and_then(|metadata| metadata.stage(run)).cloned();
+    let Some(stage) = stage else { return };
+    let mut painter = Painter { shell, images };
+    commands.spawn((DespawnOnExit(Screen::LoadScreen), Node {
+        width: Val::Percent(100.0), height: Val::Percent(100.0), justify_content: JustifyContent::Center,
+        align_items: AlignItems::Center, ..default()
+    }, BackgroundColor(Color::BLACK))).with_children(|outer| {
+        outer.spawn(Node { width: Val::Px(SCREEN.x), height: Val::Px(SCREEN.y), flex_shrink: 0.0, overflow: Overflow::clip(), ..default() }).with_children(|p| {
+            if painter.shell.files.get(&stage.loading_picture).and_then(Shp::parse).is_some()
+                && painter.shell.files.get(&stage.loading_palette).and_then(Palette::parse).is_some() {
+                let pic = painter.shell.shp(painter.images, &stage.loading_picture, &stage.loading_palette, 0);
+                p.spawn(picture(&pic, 0.0, 0.0));
+            }
+            let briefing = painter.shell.string(&stage.load_briefing);
+            let (x, y) = stage.briefing_position;
+            let line_height = painter.shell.font.height as f32;
+            for (row, line) in wrap(&painter.shell.font, &briefing, 398).iter().enumerate() {
+                let y = y as f32 + row as f32 * line_height;
+                painter.label(p, line, TEXT, Rect::new(x as f32, y, x as f32 + 398.0, y + line_height), Align::Left);
+            }
+            let title = painter.shell.string(&stage.load_message);
+            painter.label(p, &title, TEXT, Rect::new(20.0, 534.0, 778.0, 558.0), Align::Right);
+            let loading = painter.shell.string("GUI:LoadingEx");
+            painter.label(p, &loading, TEXT, Rect::new(20.0, 505.0, 500.0, 525.0), Align::Left);
+            p.spawn((Node { border: UiRect::all(Val::Px(1.0)), ..place(20.0, 568.0, 758.0, 12.0) }, BorderColor::all(EDGE), BackgroundColor(Color::BLACK))).with_children(|p| {
+                p.spawn((place(1.0, 1.0, 0.0, 8.0), BackgroundColor(SELECTED), LoadBar(754.0)));
+            });
+        });
+    });
+}
+
 /// Breaks text into lines no wider than `width`, at spaces and at the
 /// strings' own " \n " breaks.
 fn wrap(font: &Font, text: &str, width: usize) -> Vec<String> {
@@ -1089,7 +1165,8 @@ fn prepare_load(world: &mut bevy::ecs::world::World) {
     if shown.frames < 3 || shown.finished.is_some() { return }
     if let Err(error) = world.run_system_once(crate::game::load_map) {
         error!("could not prepare the map: {error}");
-        world.resource_mut::<NextState<Screen>>().set(Screen::Skirmish);
+        let screen = if world.contains_resource::<PendingCampaign>() { Screen::NewCampaign } else { Screen::Skirmish };
+        world.resource_mut::<NextState<Screen>>().set(screen);
         return;
     }
     if world.contains_resource::<crate::units::UnitView>() {
@@ -1120,8 +1197,9 @@ fn score_background(side: crate::endgame::ScoreSide, edition: Edition) -> (&'sta
 /// The score screen after a skirmish.
 // The title, "Game: n" and the time; the headings; a row for each house in
 // its colour, best first; Continue goes back to the menus.
-fn spawn_score(mut commands: Commands, mut shell: ResMut<Shell>, mut images: ResMut<Assets<Image>>, board: Res<crate::endgame::ScoreBoard>) {
+fn spawn_score(mut commands: Commands, mut shell: ResMut<Shell>, mut images: ResMut<Assets<Image>>, board: Res<crate::endgame::ScoreBoard>, campaign: Option<Res<crate::campaign::ActiveCampaign>>) {
     let board = board.clone();
+    let continuation = if campaign.is_some() { MenuAction::ContinueCampaign } else { MenuAction::Goto(Screen::Skirmish) };
     spawn_screen(&mut commands, Screen::Score, &mut shell, &mut images, |painter, p| {
         // YR adds MPYSCRNL.SHP/MPYSCRN.PAL for Yuri; the two RA2 sides
         // keep their original backgrounds and palettes.
@@ -1145,7 +1223,7 @@ fn spawn_score(mut commands: Commands, mut shell: ResMut<Shell>, mut images: Res
             },
             BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.62)),
         ));
-        painter.sidebar(p, "GUI:SkirmishScore", 9.0, 0, &[(LAST_BUTTON_SLOT, "GUI:Continue", MenuAction::Goto(Screen::Skirmish))]);
+        painter.sidebar(p, if campaign.is_some() { "GUI:Score" } else { "GUI:SkirmishScore" }, 9.0, 0, &[(LAST_BUTTON_SLOT, "GUI:Continue", continuation)]);
         let game = painter.shell.string("TXT_GAME").replacen("%d", &board.games.to_string(), 1);
         let (hours, minutes, seconds) = (board.seconds.min(359_999) / 3600, board.seconds.min(359_999) / 60 % 60, board.seconds % 60);
         let time = format!("{} {hours:02}:{minutes:02}:{seconds:02}", painter.shell.string("TXT_TIME_FORMAT_HOURS").split('%').next().unwrap_or("Time:").trim());
@@ -1184,7 +1262,7 @@ fn spawn_single_player(
             9.0,
             0,
             &[
-                (0, "GUI:NewCampaign", MenuAction::Mock("New Campaign")),
+                (0, "GUI:NewCampaign", MenuAction::Goto(Screen::NewCampaign)),
                 // There to
                 // press only when a save exists.
                 (1, "GUI:LoadSavedGame", if !crate::saves::list().is_empty() { MenuAction::Goto(Screen::LoadGame) } else { MenuAction::Tell("There are no saved games yet.") }),
@@ -1193,6 +1271,131 @@ fn spawn_single_player(
             ],
         );
     });
+}
+
+#[derive(Resource, Clone, Copy, Default)]
+struct CampaignChoice {
+    side: CampaignSide,
+    stage: usize,
+    difficulty: CampaignDifficulty,
+}
+
+#[derive(Component, Clone, Copy)]
+enum CampaignControl {
+    Side(CampaignSide),
+    Difficulty(CampaignDifficulty),
+    Stage(usize),
+}
+
+/// The mission list is an explicit mission-selection extension. Its contents
+/// and order come from the shipped MAPSEL file, with the first stage selected
+/// by default; this does not grant an unverified claim of mission completion.
+fn spawn_new_campaign(mut commands: Commands, mut shell: ResMut<Shell>, mut images: ResMut<Assets<Image>>, choice: Res<CampaignChoice>) {
+    let metadata = shell.campaigns.clone();
+    let choice = *choice;
+    spawn_screen(&mut commands, Screen::NewCampaign, &mut shell, &mut images, |painter, p| {
+        painter.sidebar(p, "GUI:NewCampaign", 9.0, 0, &[
+            (0, "GUI:StartGame", if metadata.is_ok() { MenuAction::StartCampaign } else { MenuAction::Tell("Campaign metadata is unavailable.") }),
+            (LAST_BUTTON_SLOT, "GUI:Back", MenuAction::Goto(Screen::SinglePlayer)),
+        ]);
+        let edition = match painter.shell.files.edition() { Edition::RedAlert2 => "Command & Conquer: Red Alert 2", Edition::YuriAssets => "Command & Conquer: Yuri's Revenge" };
+        painter.label_top(p, edition, TEXT, Rect::new(20.0, 32.0, 612.0, 55.0));
+        let Ok(metadata) = metadata else {
+            let error = metadata.unwrap_err();
+            for (row, line) in wrap(&painter.shell.font, &error, 550).iter().enumerate() {
+                painter.label(p, line, TEXT, Rect::new(40.0, 100.0 + row as f32 * 20.0, 590.0, 120.0 + row as f32 * 20.0), Align::Left);
+            }
+            return;
+        };
+        let mut option = |painter: &mut Painter, area: Rect, words: &str, selected: bool, control: CampaignControl| {
+            p.spawn((place(area.min.x, area.min.y, area.width(), area.height()), Button, control,
+                BackgroundColor(if selected { SELECTED } else { Color::srgba(0.0, 0.0, 0.0, 0.65) })));
+            painter.outline(p, area, EDGE);
+            painter.label(p, words, TEXT, area, Align::Center);
+        };
+        for side in [CampaignSide::Allied, CampaignSide::Soviet] {
+            let title = metadata.battles.iter().find(|battle| battle.side == side).map(|battle| painter.shell.string(&battle.description)).unwrap_or_else(|| format!("{side:?}"));
+            let x = 34.0 + side.index() as f32 * 286.0;
+            option(painter, Rect::new(x, 78.0, x + 270.0, 108.0), &title, choice.side == side, CampaignControl::Side(side));
+        }
+        for (index, (difficulty, key, fallback)) in [(CampaignDifficulty::Easy, "TXT_EASY", "Easy"), (CampaignDifficulty::Normal, "TXT_NORMAL", "Normal"), (CampaignDifficulty::Hard, "TXT_HARD", "Hard")].into_iter().enumerate() {
+            let title = painter.shell.strings.get(key).unwrap_or(fallback).to_owned();
+            let x = 34.0 + index as f32 * 191.0;
+            option(painter, Rect::new(x, 122.0, x + 174.0, 150.0), &title, choice.difficulty == difficulty, CampaignControl::Difficulty(difficulty));
+        }
+        let stages = metadata.stages(choice.side);
+        for (index, stage) in stages.iter().enumerate() {
+            let title = painter.shell.string(&stage.ui_name);
+            let words = format!("{:02}. {title}", index + 1);
+            let y = 170.0 + index as f32 * 21.0;
+            let area = Rect::new(34.0, y, 598.0, y + 20.0);
+            p.spawn((place(area.min.x, area.min.y, area.width(), area.height()), Button, CampaignControl::Stage(index), BackgroundColor(if choice.stage == index { SELECTED } else { Color::srgba(0.0, 0.0, 0.0, 0.65) })));
+            painter.label(p, &words, TEXT, Rect::new(area.min.x + 6.0, area.min.y, area.max.x - 6.0, area.max.y), Align::Left);
+        }
+        if let Some(stage) = stages.get(choice.stage) {
+            let briefing = painter.shell.string(&stage.briefing);
+            let height = painter.shell.font.height as f32;
+            let rows = ((566.0 - 438.0) / height.max(1.0)) as usize;
+            for (row, line) in wrap(&painter.shell.font, &briefing, 552).iter().take(rows).enumerate() {
+                let y = 438.0 + row as f32 * height;
+                painter.label(p, line, TEXT, Rect::new(40.0, y, 592.0, y + height), Align::Left);
+            }
+        }
+    });
+}
+
+fn on_campaign_control(
+    activate: On<Activate>, controls: Query<&CampaignControl>, mut choice: ResMut<CampaignChoice>,
+    mut next: ResMut<NextState<Screen>>, mut redraw: ResMut<Redraw>, shell: Res<Shell>,
+    mut cues: MessageWriter<crate::audio::Cue>, mut prefs: ResMut<crate::prefs::Prefs>,
+) {
+    let Ok(control) = controls.get(activate.entity) else { return };
+    match *control {
+        CampaignControl::Side(side) => { choice.side = side; choice.stage = 0; }
+        CampaignControl::Stage(stage) => choice.stage = stage,
+        CampaignControl::Difficulty(difficulty) => {
+            choice.difficulty = difficulty;
+            prefs.difficulty = match difficulty { CampaignDifficulty::Easy => 0, CampaignDifficulty::Normal => 1, CampaignDifficulty::Hard => 2 };
+            prefs.save();
+        }
+    }
+    cues.write_batch(crate::audio::rules_sound(&shell.files, "GenericClick").map(crate::audio::Cue::Sound));
+    redraw.0 = true;
+    next.set(Screen::NewCampaign);
+}
+
+fn prepare_campaign_start(shell: &Shell, choice: &CampaignChoice, setup: &mut GameSetup, commands: &mut Commands) -> bool {
+    let Ok(metadata) = &shell.campaigns else { return false };
+    let Some(run) = metadata.run(choice.side, choice.stage, choice.difficulty) else { return false };
+    prepare_campaign_run(shell, run, setup, commands)
+}
+
+fn prepare_campaign_run(shell: &Shell, run: crate::campaign::CampaignRun, setup: &mut GameSetup, commands: &mut Commands) -> bool {
+    let Ok(metadata) = &shell.campaigns else { return false };
+    if shell.files.get(&run.scenario).is_none() { return false }
+    let Some(stage) = metadata.stage(&run) else { return false };
+    setup.map = run.map_stem().to_owned();
+    setup.map_name = shell.string(&stage.ui_name);
+    setup.mode_rules.clear();
+    setup.max_players = 1;
+    commands.remove_resource::<crate::campaign::ActiveCampaign>();
+    commands.insert_resource(PendingCampaign(run));
+    true
+}
+
+fn continue_campaign(shell: &Shell, campaign: Option<&crate::campaign::ActiveCampaign>, won: bool, setup: &mut GameSetup, commands: &mut Commands) -> Screen {
+    let next = campaign.and_then(|campaign| {
+        let metadata = shell.campaigns.as_ref().ok()?;
+        metadata.stage(&campaign.0)?;
+        if won { metadata.next(&campaign.0) } else { Some(campaign.0.clone()) }
+    });
+    if let Some(run) = next {
+        if prepare_campaign_run(shell, run, setup, commands) { return Screen::LoadScreen }
+        warn!("campaign continuation could not read its scenario");
+    }
+    commands.remove_resource::<crate::campaign::ActiveCampaign>();
+    commands.remove_resource::<PendingCampaign>();
+    Screen::NewCampaign
 }
 
 /// The Load Saved Game screen: every save, newest first, the first picked.
@@ -2580,6 +2783,7 @@ fn slot_frames(
 // steps.
 #[allow(clippy::too_many_arguments)]
 fn finish_leaving(
+    mut commands: Commands,
     mut slide: ResMut<Slide>,
     time: Res<Time<Real>>,
     mut next_screen: ResMut<NextState<Screen>>,
@@ -2590,6 +2794,8 @@ fn finish_leaving(
     mut lobby: ResMut<crate::net::Lobby>,
     mut redraw: ResMut<Redraw>,
     mut saves: ResMut<crate::saves::SaveLoad>,
+    campaign: Res<CampaignChoice>,
+    (active_campaign, board): (Option<Res<crate::campaign::ActiveCampaign>>, Res<crate::endgame::ScoreBoard>),
 ) {
     let Some((action, began)) = slide.leaving else {
         return;
@@ -2606,6 +2812,8 @@ fn finish_leaving(
             next_screen.set(Screen::Skirmish);
         }
         MenuAction::StartGame => {
+            commands.remove_resource::<PendingCampaign>();
+            commands.remove_resource::<crate::campaign::ActiveCampaign>();
             if let Some(map) = shell.maps.get(choice.selected) {
                 setup.map = map.id.clone();
                 setup.map_name = map.name.clone();
@@ -2623,6 +2831,15 @@ fn finish_leaving(
                     next_screen.set(Screen::LoadScreen);
                 }
             }
+        }
+        MenuAction::StartCampaign => {
+            if prepare_campaign_start(&shell, &campaign, &mut setup, &mut commands) {
+                lobby.mode = crate::net::LobbyMode::Off;
+                next_screen.set(Screen::LoadScreen);
+            }
+        }
+        MenuAction::ContinueCampaign => {
+            next_screen.set(continue_campaign(&shell, active_campaign.as_deref(), board.won, &mut setup, &mut commands));
         }
         MenuAction::HostGame => {
             lobby.mode = crate::net::LobbyMode::Hosting;
@@ -2666,6 +2883,7 @@ fn finish_leaving(
 #[allow(clippy::too_many_arguments)]
 fn on_menu_action(
     activate: On<Activate>,
+    mut commands: Commands,
     actions: Query<(&MenuAction, Has<Slot>)>,
     mut next_screen: ResMut<NextState<Screen>>,
     mut choice: ResMut<MapChoice>,
@@ -2678,7 +2896,7 @@ fn on_menu_action(
     mut lobby: ResMut<crate::net::Lobby>,
     mut redraw: ResMut<Redraw>,
     mut saves: ResMut<crate::saves::SaveLoad>,
-    mut notices: MessageWriter<crate::notice::Notice>,
+    (mut notices, campaign, active_campaign, board): (MessageWriter<crate::notice::Notice>, Res<CampaignChoice>, Option<Res<crate::campaign::ActiveCampaign>>, Res<crate::endgame::ScoreBoard>),
 ) {
     let Ok((action, slot)) = actions.get(activate.entity) else {
         return;
@@ -2699,6 +2917,8 @@ fn on_menu_action(
             next_screen.set(Screen::Skirmish);
         }
         MenuAction::StartGame => {
+            commands.remove_resource::<PendingCampaign>();
+            commands.remove_resource::<crate::campaign::ActiveCampaign>();
             if let Some(map) = shell.maps.get(choice.selected) {
                 setup.map = map.id.clone();
                 setup.map_name = map.name.clone();
@@ -2716,6 +2936,17 @@ fn on_menu_action(
                     next_screen.set(Screen::LoadScreen);
                 }
             }
+        }
+        MenuAction::StartCampaign => {
+            if prepare_campaign_start(&shell, &campaign, &mut setup, &mut commands) {
+                lobby.mode = crate::net::LobbyMode::Off;
+                next_screen.set(Screen::LoadScreen);
+            } else {
+                notices.write(crate::notice::Notice("The selected campaign scenario could not be read.".into()));
+            }
+        }
+        MenuAction::ContinueCampaign => {
+            next_screen.set(continue_campaign(&shell, active_campaign.as_deref(), board.won, &mut setup, &mut commands));
         }
         MenuAction::HostGame => {
             lobby.mode = crate::net::LobbyMode::Hosting;
@@ -2838,6 +3069,59 @@ fn map_list_scroll(
 #[cfg(test)]
 mod combo_tests {
     use super::*;
+
+    #[test]
+    fn selected_campaign_prepares_the_named_edition_side_stage_and_difficulty() {
+        let dir = crate::files::dev_dir();
+        if crate::files::find(&dir, "ra2.mix").is_none() { return }
+        for edition in [Edition::RedAlert2, Edition::YuriAssets] {
+            if edition == Edition::YuriAssets && crate::files::find(&dir, "ra2md.mix").is_none() { continue }
+            let shell = Shell::load(GameFiles::open_for_edition(&dir, edition).unwrap());
+            let options = crate::game::Options::default();
+            let mut setup = GameSetup { map: "mp02t2".into(), map_name: "Skirmish".into(), options, max_players: 8, mode_rules: "MPBattle.ini".into() };
+            let choice = CampaignChoice { side: CampaignSide::Soviet, stage: 1, difficulty: CampaignDifficulty::Hard };
+            let mut world = bevy::ecs::world::World::new();
+            let mut queue = bevy::ecs::world::CommandQueue::default();
+            assert!(prepare_campaign_start(&shell, &choice, &mut setup, &mut Commands::new(&mut queue, &world)));
+            queue.apply(&mut world);
+            let run = &world.resource::<PendingCampaign>().0;
+            assert_eq!((run.edition, run.side, run.stage, run.difficulty), (edition, CampaignSide::Soviet, 1, CampaignDifficulty::Hard));
+            assert_eq!(setup.map, if edition == Edition::RedAlert2 { "sov02t" } else { "sov02smd" });
+            assert!(setup.mode_rules.is_empty());
+            assert_eq!(setup.options, options, "starting a campaign must not overwrite the player's skirmish choices");
+            assert_eq!(run.title(&shell.files), Some(setup.map_name));
+        }
+    }
+
+    #[test]
+    fn campaign_continue_advances_only_after_victory_and_retries_defeat() {
+        let dir = crate::files::dev_dir();
+        if crate::files::find(&dir, "ra2.mix").is_none() { return }
+        for edition in [Edition::RedAlert2, Edition::YuriAssets] {
+            if edition == Edition::YuriAssets && crate::files::find(&dir, "ra2md.mix").is_none() { continue }
+            let shell = Shell::load(GameFiles::open_for_edition(&dir, edition).unwrap());
+            let metadata = shell.campaigns.as_ref().unwrap();
+            let run = metadata.run(CampaignSide::Allied, 0, CampaignDifficulty::Hard).unwrap();
+            for (won, expected) in [(false, 0), (true, 1)] {
+                let mut world = bevy::ecs::world::World::new();
+                let mut queue = bevy::ecs::world::CommandQueue::default();
+                let mut setup = GameSetup { map: String::new(), map_name: String::new(), options: default(), max_players: 1, mode_rules: String::new() };
+                let active = crate::campaign::ActiveCampaign(run.clone());
+                assert_eq!(continue_campaign(&shell, Some(&active), won, &mut setup, &mut Commands::new(&mut queue, &world)), Screen::LoadScreen);
+                queue.apply(&mut world);
+                let next = &world.resource::<PendingCampaign>().0;
+                assert_eq!((next.edition, next.side, next.stage, next.difficulty), (edition, run.side, expected, run.difficulty));
+            }
+            let last = metadata.run(CampaignSide::Allied, metadata.stages(CampaignSide::Allied).len() - 1, CampaignDifficulty::Normal).unwrap();
+            let active = crate::campaign::ActiveCampaign(last);
+            let mut world = bevy::ecs::world::World::new();
+            let mut queue = bevy::ecs::world::CommandQueue::default();
+            let mut setup = GameSetup { map: String::new(), map_name: String::new(), options: default(), max_players: 1, mode_rules: String::new() };
+            assert_eq!(continue_campaign(&shell, Some(&active), true, &mut setup, &mut Commands::new(&mut queue, &world)), Screen::NewCampaign);
+            queue.apply(&mut world);
+            assert!(!world.contains_resource::<PendingCampaign>());
+        }
+    }
 
     #[test]
     fn score_background_uses_the_native_three_faction_assets() {

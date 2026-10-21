@@ -89,6 +89,19 @@ impl World {
         }
     }
 
+    /// Action63's sure hit bypasses the weapon/BridgesDestroyable/random gates.
+    /// Original DestroyBridgeAt dispatches low bridge overlays before trying
+    /// its high bridge branch. The caller retries while this returns false.
+    pub(crate) fn damage_mission_bridge(&mut self, cell: (i32, i32)) -> bool {
+        if matches!(self.bridge_kind(cell), 0x4a..=0x63 | 0xcd..=0xe6) {
+            self.damage_low_bridge(cell)
+        } else if self.map.bridged(cell.0, cell.1) {
+            self.high_owner(cell).is_some_and(|owner| self.damage_high_bridge(owner))
+        } else {
+            false
+        }
+    }
+
     // ------------------------------------------------------------- low bridges
 
     /// The three cells across a low bridge section, from any one of them.

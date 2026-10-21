@@ -1,0 +1,11 @@
+# YR original Tag/Raise/Register/HasOccured/Attach/Destroy/PointerExpired with FireActions recorder and fixed Notice broadcast. Physically reachable single6 refcounts1..3.
+# persistence initial_refs refs_after owner_attached_mask trigger_destroyed_mask occurred_mask fire_count
+0	1	0	0	1	0	1
+0	2	0	0	1	0	1
+0	3	0	0	1	0	1
+1	1	0	0	1	0	1
+1	2	1	2	0	0	0
+1	3	2	6	0	0	0
+2	1	1	1	0	0	1
+2	2	2	3	0	0	1
+2	3	3	7	0	0	1

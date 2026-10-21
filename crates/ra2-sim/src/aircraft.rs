@@ -24,6 +24,185 @@ pub struct PlaneStats {
     pub pitch_speed: i32,
 }
 
+#[cfg(test)]
+mod campaign_tests {
+    use super::*;
+
+    fn delivery_world(human: bool) -> World {
+        let mut map = crate::Map::new(48, 48);
+        for y in 0..48 { for x in 0..48 { map.set_cell(x, y, true, 0); } }
+        let mut world = World::new(map, None);
+        world.houses.push(crate::House { human, ..crate::House::default() });
+        world.unit_types.push(crate::UnitType { stats: crate::UnitStats { kind: 1, infantry: true, speed_type: crate::SpeedType::Foot, strength: 100, speed: 4, ..crate::UnitStats::default() }, ..crate::UnitType::default() });
+        world.unit_types.push(crate::UnitType { stats: crate::UnitStats {
+            kind: 2, strength: 400, speed: 15, rot: 2,
+            plane: Some(PlaneStats { flight_level: 1500, fighter: false, airport_bound: false, landable: false, ammo: 100, slowdown: 500, pitch_speed: 250 }),
+            ..crate::UnitStats::default()
+        }, ..crate::UnitType::default() });
+        world.super_rules.radius = 1024;
+        world.super_rules.fall_rate = 10;
+        world.attach_mission(crate::mission::MissionData { id: "delivery-test".into(), ..crate::mission::MissionData::default() }).unwrap();
+        world
+    }
+
+    fn cargo(world: &mut World, count: usize) -> Vec<Unit> {
+        (0..count).map(|_| {
+            let mut unit = world.make_unit((0, 0), 0, world.unit_types[0].stats, 0);
+            unit.x = 0; unit.y = 0;
+            unit
+        }).collect()
+    }
+
+    #[test]
+    fn native_full_facing_release_keeps_cardinal_residues_and_subbyte_turns() {
+        // Captured original x86 results, rather than ordinary sin/cos at a
+        // byte-facing quarter turn. Ammo100 is the first side.
+        for (facing, first, second) in [
+            (0, (32640, 32767), (32896, 32768)),
+            (63, (32640, 32767), (32895, 32768)),
+            (255, (32640, 32764), (32895, 32770)),
+            (256, (32640, 32764), (32895, 32771)),
+            (16383, (32768, 32640), (32768, 32895)),
+            (32767, (32896, 32768), (32640, 32767)),
+            (49151, (32767, 32896), (32768, 32640)),
+            (65535, (32640, 32767), (32896, 32768)),
+        ] {
+            assert_eq!(native_drop_position(32768, 32768, facing, 100), first);
+            assert_eq!(native_drop_position(32768, 32768, facing, 99), second);
+        }
+    }
+
+    #[test]
+    fn campaign_delivery_sets_destination_before_distance_and_resets_queue_timer_before_flight() {
+        let mut world = delivery_world(true);
+        let cargo = cargo(&mut world, 2);
+        let head = cargo.last().unwrap().id;
+        let plane = world.create_campaign_paradrop(1, 0, (20, 20), (20, 20), cargo);
+        let mut expected_random = world.random;
+        crate::random_step(&mut expected_random);
+        world.fly_planes();
+        let unit = world.unit(plane).unwrap();
+        assert_eq!(unit.cargo.len(), 2);
+        assert_eq!(unit.plane.unwrap().mission, Mission::ParadropApproach);
+        assert_eq!(unit.plane.unwrap().wake, 3);
+        world.tick = 3;
+        world.fly_planes();
+        assert_eq!(world.unit(plane).unwrap().plane.unwrap().mission, Mission::ParadropOverfly);
+        assert_eq!(world.unit(plane).unwrap().plane.unwrap().wake, 3, "native NextMission clears the queued timer");
+        assert!(world.unit(head).is_none(), "the transition frame only changes mission and moves");
+        world.tick = 4;
+        world.fly_planes();
+        let passenger = world.unit(head).expect("first Overfly drops the native head on the next frame");
+        assert!(passenger.falling.is_some());
+        assert_eq!(world.unit_mission(head), Some(crate::mission::UnitMission::Guard));
+        assert!(world.landing_orders.is_empty(), "parachute Guard must not enqueue a later Stop that clears Guard");
+        let unit = world.unit(plane).unwrap();
+        assert_eq!(unit.stats.kind, 2, "inserting an older cargo ID before the plane must not overwrite either object");
+        assert_eq!(unit.cargo.len(), 1);
+        assert_eq!(unit.plane.unwrap().ammo, 99);
+        assert_eq!(unit.plane.unwrap().wake, 9);
+        assert_eq!(world.random, expected_random, "the central subposition chooses once; mission cadence adds no random jitter");
+        for _ in 0..180 { world.tick += 1; world.run_supers(); }
+        assert!(world.unit(head).unwrap().falling.is_none());
+        assert_eq!(world.unit_mission(head), Some(crate::mission::UnitMission::Guard));
+    }
+
+    #[test]
+    fn a_blocked_drop_retries_the_same_head_and_snapshot_restores_the_remaining_chain() {
+        let mut world = delivery_world(false);
+        let cargo = cargo(&mut world, 2);
+        let head = cargo.last().unwrap().id;
+        let tail = cargo[0].id;
+        let plane_id = world.create_campaign_paradrop(1, 0, (20, 20), (20, 20), cargo);
+        let index = world.units.iter().position(|unit| unit.id == plane_id).unwrap();
+        let mut plane = world.units[index].plane.unwrap();
+        let (x, y) = native_drop_position(world.units[index].x, world.units[index].y, 0, 100);
+        let cell = cell_of(x, y);
+        let at = world.map.index(cell.0, cell.1).unwrap();
+        let blocker = world.add_unit(cell, 0, crate::UnitStats { strength: 100, ..crate::UnitStats::default() }, 0);
+        world.campaign_drop_one(index, &mut plane);
+        assert_eq!(world.units[index].cargo.iter().map(|unit| unit.id).collect::<Vec<_>>(), vec![tail, head]);
+        assert_eq!(plane.ammo, 100);
+        assert_eq!(plane.passes, 5);
+        assert!(world.unit(head).is_none());
+        let blocker_index = world.units.iter().position(|unit| unit.id == blocker).unwrap();
+        world.lift(blocker_index);
+        assert_eq!(world.claims[at], 0);
+        world.campaign_drop_one(index, &mut plane);
+        let index = world.units.iter().position(|unit| unit.id == plane_id).unwrap();
+        world.units[index].plane = Some(plane);
+        assert_eq!(world.unit_mission(head), Some(crate::mission::UnitMission::Hunt));
+        assert_eq!(world.units[index].cargo[0].id, tail);
+        let save = world.snapshot();
+        let mut restored = delivery_world(false);
+        restored.restore(&save).unwrap();
+        for candidate in [&mut world, &mut restored] {
+            let index = candidate.units.iter().position(|unit| unit.id == plane_id).unwrap();
+            let mut plane = candidate.units[index].plane.unwrap();
+            candidate.campaign_drop_one(index, &mut plane);
+            let index = candidate.units.iter().position(|unit| unit.id == plane_id).unwrap();
+            candidate.units[index].plane = Some(plane);
+            assert!(candidate.units[index].cargo.is_empty());
+            assert!(candidate.unit(tail).unwrap().falling.is_some());
+        }
+        assert_eq!(world.state_hash(), restored.state_hash());
+    }
+
+    #[test]
+    fn aircraft_type_speed_and_rot_overrides_reach_the_campaign_fly_path() {
+        let mut slow = delivery_world(true);
+        let mut fast = delivery_world(true);
+        slow.unit_types[1].stats.speed = 3;
+        slow.unit_types[1].stats.rot = 1;
+        fast.unit_types[1].stats.speed = 15;
+        fast.unit_types[1].stats.rot = 5;
+        for world in [&mut slow, &mut fast] {
+            let cargo = cargo(world, 1);
+            world.create_campaign_paradrop(1, 0, (10, 30), (35, 10), cargo);
+            for tick in 0..30 { world.tick = tick; world.fly_planes(); }
+        }
+        let slow = slow.units.iter().find(|unit| unit.plane.is_some()).unwrap();
+        let fast = fast.units.iter().find(|unit| unit.plane.is_some()).unwrap();
+        assert_ne!((slow.x, slow.y), (fast.x, fast.y));
+        assert_ne!(slow.facing, fast.facing);
+        assert!(fast.plane.unwrap().cur_speed > 0.0);
+    }
+
+    #[test]
+    fn flat_winged_edges_match_native_geometry_and_keep_souths_unused_first_draw() {
+        // Captured from the complete original PickCellOnEdge CPU harness.
+        for (vx, vy, edge, expected) in [
+            (0, 0, 0, (0, 80)), (0, 0, 1, (4, 76)),
+            (0, 0, 2, (9, 82)), (0, 0, 3, (0, 79)),
+            (1, 1, 0, (2, 79)), (1, 1, 1, (6, 75)),
+            (1, 1, 2, (11, 82)), (1, 1, 3, (1, 79)),
+        ] {
+            let mut map = crate::Map::new(192, 192);
+            map.set_playfield(80, 80, [vx, vy, 4, 4]);
+            let mut world = World::new(map, None);
+            let bound = if edge == 3 { 9 } else if edge == 1 { 8 } else { 4 };
+            let seed = (1..100000u64).find(|&seed| {
+                let mut state = seed;
+                crate::random_step(&mut state) % bound == 0
+                    && (edge != 2 || crate::random_step(&mut state) % 4 == 3)
+            }).unwrap();
+            world.random = seed;
+            let mut expected_random = seed;
+            crate::random_step(&mut expected_random);
+            if edge == 2 { crate::random_step(&mut expected_random); }
+            assert_eq!(world.campaign_paradrop_edge_for(edge, false, 0), Some(expected));
+            assert_eq!(world.random, expected_random, "South consumes two random requests, the other edges one");
+        }
+        let mut map = crate::Map::new(192, 192);
+        map.set_playfield(80, 80, [0, 0, 1, 4]);
+        let mut world = World::new(map, None);
+        let random = world.random;
+        assert_eq!(world.campaign_paradrop_edge_for(0, false, 0), Some((0, 80)));
+        assert_eq!(world.random, random, "native equal-bound RandomRange does not advance");
+        assert!(world.campaign_paradrop_edge_for(-1, true, 0).is_none(), "YR StartingEdge can change with buildings and must not be guessed");
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Mission {
     Guard,
@@ -83,6 +262,10 @@ pub struct Plane {
     pub(crate) passes: u8,
     pub(crate) drops: u8,
     pub(crate) retreat: Option<(i32, i32)>,
+    /// The separate, unteamed PDPLANE created by a campaign Droppod TeamType.
+    /// Its native-head passenger order and mission cadence differ from the
+    /// older superweapon delivery path.
+    pub(crate) campaign_drop: bool,
     /// The landing sound has been heard on this way down.
     landing_heard: bool,
     /// Leaning into a turn: 1 turning clockwise, -1 the other way, 0 level.
@@ -117,6 +300,7 @@ impl Plane {
             passes: 5,
             drops: 0,
             retreat: None,
+            campaign_drop: false,
             landing_heard: false,
             bank: 0,
         }
@@ -152,6 +336,30 @@ fn direction(from: (i32, i32), to: (i32, i32)) -> u16 {
 
 fn angle_of(facing: u16) -> f64 {
     (facing as i16 as f64 - 16383.0) * (-std::f64::consts::PI / 32768.0)
+}
+
+/// Original DropOne's table lookup, including its signed 0x3fff side angle.
+/// The float table is mechanical mathematical data from the native lookup;
+/// see the sibling 131072-case original-code full-facing CPU verification.
+fn native_drop_position(x: i32, y: i32, facing: u16, ammo: i32) -> (i32, i32) {
+    const SINE: &[u8; 40960] = include_bytes!("paradrop_sine.bin");
+    let side = if ammo.wrapping_sub(1) & 1 != 0 { -0x3fffi32 } else { 0x3fff };
+    let direction = facing.wrapping_add(side as u16) as i16;
+    let angle = (i32::from(direction) - 0x3fff) as f64 * -9.587672516830327e-05;
+    let lookup = |cosine: bool| {
+        let k = (angle * 2607.594482421875) as i32;
+        let mut index = (k / 2).rem_euclid(8192) as usize + if cosine { 2048 } else { 0 };
+        if k & 1 != 0 && index < if cosine { 10239 } else { 8191 } { index += 1; }
+        f64::from(f32::from_le_bytes(SINE[index * 4..index * 4 + 4].try_into().unwrap()))
+    };
+    let add = |coordinate: i32, offset: f64| {
+        // Native x87 retains small signed cardinal residues while adding the
+        // whole coordinate. Adding with f64 first loses them at integer edges.
+        if coordinate > 128 { coordinate + offset.floor() as i32 }
+        else if coordinate < -128 { coordinate + offset.ceil() as i32 }
+        else { (f64::from(coordinate) + offset) as i32 }
+    };
+    (add(x, 128.0 * lookup(true)), add(y, -128.0 * lookup(false)))
 }
 
 impl World {
@@ -444,6 +652,9 @@ impl World {
 
     /// One turn of an aircraft's mission; returns the wait before the next.
     fn plane_mission(&mut self, index: usize, plane: &mut Plane) -> u64 {
+        if plane.campaign_drop {
+            return self.campaign_paradrop_mission(index, plane);
+        }
         let Some(stats) = self.units[index].stats.plane else {
             return 15;
         };
@@ -781,7 +992,7 @@ impl World {
                 let angle = angle_of(unit.turn.current());
                 let (x, y) = ((angle.cos() * speed as f64 + unit.x as f64) as i32, (unit.y as f64 - angle.sin() * speed as f64) as i32);
                 let cell = cell_of(x, y);
-                if cell.0 >= 0 && cell.1 >= 0 && cell.0 < self.map.width && cell.1 < self.map.height {
+                if plane.campaign_drop || (cell.0 >= 0 && cell.1 >= 0 && cell.0 < self.map.width && cell.1 < self.map.height) {
                     unit.x = x;
                     unit.y = y;
                 }
@@ -914,7 +1125,12 @@ impl World {
 
     /// Every aircraft takes its turn: its mission, then its flight.
     pub(crate) fn fly_planes(&mut self) {
-        for index in 0..self.units.len() {
+        // Campaign cargo was constructed before its extra delivery plane.
+        // Unlimbo therefore inserts a dropped passenger before that plane in
+        // the ID-sorted list; indices cannot survive a mission call.
+        let planes: Vec<u32> = self.units.iter().filter(|unit| unit.plane.is_some()).map(|unit| unit.id).collect();
+        for id in planes {
+            let Some(index) = self.units.iter().position(|unit| unit.id == id) else { continue; };
             let Some(mut plane) = self.units[index].plane else {
                 continue;
             };
@@ -924,7 +1140,7 @@ impl World {
             // Outside an attack
             // the pass is over and a fired shot is counted; a target that has
             // taken to the air is dropped.
-            if plane.mission != Mission::Attack {
+            if plane.mission != Mission::Attack && !plane.campaign_drop {
                 plane.locked = false;
                 if std::mem::take(&mut plane.pending) && plane.ammo > 0 {
                     plane.ammo -= 1;
@@ -939,9 +1155,20 @@ impl World {
                 let wait = self.plane_mission(index, &mut plane);
                 plane.wake = self.tick + wait;
             }
+            let Some(index) = self.units.iter().position(|unit| unit.id == id) else { continue; };
             // A cargo plane that has been shot down falls as any aircraft does;
             // only one still flying keeps its course.
-            if !plane.crashing && matches!(plane.mission, Mission::ParadropApproach | Mission::ParadropOverfly | Mission::Retreat) {
+            if plane.campaign_drop {
+                self.plane_process(index, &mut plane);
+                if !plane.crashing && self.units[index].health > 0 && plane.mission == Mission::Retreat && !self.map.in_playfield(self.units[index].cell().0, self.units[index].cell().1) {
+                    if !self.units[index].cargo.is_empty() {
+                        self.discard_campaign_aircraft_cargo(index);
+                    }
+                    self.units[index].plane = Some(plane);
+                    self.vanish(id);
+                    continue;
+                }
+            } else if !plane.crashing && matches!(plane.mission, Mission::ParadropApproach | Mission::ParadropOverfly | Mission::Retreat) {
                 if self.paradrop_fly(index, &mut plane) {
                     self.units[index].plane = Some(plane);
                     let id = self.units[index].id;
@@ -953,6 +1180,206 @@ impl World {
             }
             self.units[index].plane = Some(plane);
         }
+    }
+
+    /// The extra aircraft is not a Team member. Its cargo already belongs to
+    /// the reinforcement Team and is stored with the native linked head last.
+    pub(crate) fn create_campaign_paradrop(&mut self, kind: u16, house: u8, origin: (i32, i32), target: (i32, i32), cargo: Vec<Unit>) -> u32 {
+        let stats = crate::UnitStats { kind: kind + 1, ..self.unit_types[kind as usize].stats };
+        let mut unit = self.make_unit(origin, 0, stats, house);
+        let mut plane = Plane::parked(&stats.plane.expect("validated PDPLANE"));
+        plane.z = stats.plane.unwrap().flight_level;
+        plane.flight_level = plane.z;
+        plane.mission = Mission::ParadropApproach;
+        plane.drop = Some(target);
+        plane.campaign_drop = true;
+        plane.wake = self.tick;
+        unit.cargo = cargo;
+        unit.plane = Some(plane);
+        let id = unit.id;
+        self.put_back(unit);
+        id
+    }
+
+    fn campaign_paradrop_destination(&mut self, index: usize, plane: &mut Plane, cell: (i32, i32)) {
+        self.set_goal(index, plane, Some(Goal::Cell(cell.0, cell.1)));
+        // Native Fly.Move_To treats a live Target with ammunition as an
+        // elevated destination. The Target here is kept separately in drop.
+        if plane.drop.is_some() && plane.ammo != 0 {
+            if let Some(to) = plane.moving_to.as_mut() {
+                to.2 += self.units[index].stats.plane.unwrap().flight_level;
+                plane.elevating = true;
+            }
+        }
+    }
+
+    fn campaign_paradrop_retreat(&mut self, index: usize, plane: &mut Plane) {
+        plane.locked = false;
+        plane.drop = None;
+        // Stop on the original nonlandable Fly keeps an order to the current
+        // centre, then the outer Foot.SetDestination restores Destination=null.
+        // It does not call BeginLanding or reset the current speed.
+        let cell = self.units[index].cell();
+        self.campaign_paradrop_destination(index, plane, cell);
+        plane.goal = None;
+        plane.mission = Mission::Retreat;
+    }
+
+    fn campaign_paradrop_mission(&mut self, index: usize, plane: &mut Plane) -> u64 {
+        let unit = &self.units[index];
+        let distance = plane.drop.map(|target| {
+            let (x, y) = cell_centre(target);
+            let (dx, dy) = (i64::from(x) - i64::from(unit.x), i64::from(y) - i64::from(unit.y));
+            crate::path::engine_sqrt((dx * dx + dy * dy) as f32) as i32
+        });
+        match plane.mission {
+            Mission::ParadropApproach => {
+                let Some(target) = plane.drop else {
+                    self.campaign_paradrop_retreat(index, plane);
+                    return 0;
+                };
+                if plane.goal.is_none() {
+                    self.campaign_paradrop_destination(index, plane, target);
+                    return 3;
+                }
+                if distance.is_some_and(|distance| distance <= self.super_rules.radius) {
+                    plane.passes = plane.passes.wrapping_sub(1);
+                    plane.mission = Mission::ParadropOverfly;
+                    // ReadyToNext/NextMission runs before Fly movement and
+                    // resets the timer. Overfly itself starts next frame.
+                    return 0;
+                }
+                3
+            }
+            Mission::ParadropOverfly => {
+                plane.locked = true;
+                if plane.drop.is_none() || self.units[index].cargo.is_empty() {
+                    self.campaign_paradrop_retreat(index, plane);
+                    return 0;
+                }
+                if distance.is_some_and(|distance| distance > self.super_rules.radius) {
+                    plane.locked = false;
+                    if (plane.passes as i8) > 0 { plane.mission = Mission::ParadropApproach; }
+                    else { self.campaign_paradrop_retreat(index, plane); }
+                    return 0;
+                }
+                let cell = self.units[index].cell();
+                if self.map.in_playfield(cell.0, cell.1) { self.campaign_drop_one(index, plane); }
+                5
+            }
+            Mission::Retreat => {
+                if let Some(Goal::Cell(x, y)) = plane.goal {
+                    if (x, y) == self.units[index].cell() {
+                        self.campaign_paradrop_destination(index, plane, (x, y));
+                        plane.goal = None;
+                    }
+                } else if let Some(edge) = self.campaign_paradrop_edge(self.units[index].owner, self.units[index].id) {
+                    plane.retreat = Some(edge);
+                    self.campaign_paradrop_destination(index, plane, edge);
+                }
+                3
+            }
+            _ => 3,
+        }
+    }
+
+    /// Bounded original Winged PickCellOnEdge: empty Current/Fallback and
+    /// zero-height candidate cells. Equal random bounds do not advance RNG.
+    pub(crate) fn campaign_paradrop_edge(&mut self, owner: u8, aircraft: u32) -> Option<(i32, i32)> {
+        let edge = self.mission_data.as_ref().and_then(|data| data.house_edges.iter().find(|entry| entry.0 == owner)).map_or(-1, |entry| entry.1);
+        let yuri = self.mission_data.as_ref().is_some_and(|data| data.yuri);
+        self.campaign_paradrop_edge_for(edge, yuri, aircraft)
+    }
+
+    pub(crate) fn campaign_paradrop_edge_for(&mut self, edge: i32, yuri: bool, aircraft: u32) -> Option<(i32, i32)> {
+        let Some((full, [vx, vy, width, height])) = self.map.playfield else {
+            self.diagnose_campaign_paradrop(aircraft, "EdgeGeometry", "Winged edge selection needs the original Size/LocalSize geometry; a rectangular top-edge replacement was not used.");
+            return None;
+        };
+        if width <= 0 || height <= 0 { return None; }
+        if yuri && !(0..=3).contains(&edge) {
+            self.diagnose_campaign_paradrop(aircraft, "StartingEdge", "Invalid YR Owner.Edge uses mutable House.StartingEdge, which buildings can update. This path waits for that original state rather than guessing North.");
+            return None;
+        }
+        let edge = if (0..=3).contains(&edge) { edge } else { 0 };
+        if self.campaign_random.is_none() {
+            self.diagnose_campaign_paradrop(aircraft, "NativeRandomStream", "Edge requests preserve original inclusive bounds and order, including South's unused first draw. This World has no original Scenario.Random stream configured.");
+        }
+        let range = |world: &mut World, lo: i32, hi: i32| if lo == hi { lo } else { world.scenario_random_range(lo, hi) };
+        let to_cell = |x: i32, y: i32| (x + vx + ((y + vy + 1) >> 1), full + ((y + vy) >> 1) - x - vx);
+        let outside = |world: &World, cell: (i32, i32)| {
+            if world.map.level(cell.0, cell.1) != 0 || world.map.bridged(cell.0, cell.1) { return None; }
+            let (x, y) = cell;
+            Some(!(x + y > full + 2 * vy && x + y <= full + 2 * (vy + height) + 2
+                && x - y < 2 * (vx + width) - full && y - x < full - 2 * vx))
+        };
+        let span = if matches!(edge, 1 | 3) { height * 2 } else { width };
+        let start = range(self, if edge == 3 { 0 } else { 1 }, span) - 1;
+        if edge == 2 {
+            let mut candidates = Vec::new();
+            for x in 0..width {
+                for extra in 0..15 {
+                    let cell = to_cell(x, height * 2 + extra);
+                    match outside(self, cell) {
+                        Some(true) => { candidates.push(cell); break; }
+                        Some(false) => {}
+                        None => { self.diagnose_campaign_paradrop(aircraft, "EdgeHeight", "This original edge candidate needs the height/bridge-sensitive radar predicate."); return None; }
+                    }
+                }
+            }
+            return if candidates.is_empty() { None } else { Some(candidates[range(self, 0, candidates.len() as i32 - 1) as usize]) };
+        }
+        for offset in 0..span {
+            let across = (start + offset) % span;
+            let cell = match edge { 1 => to_cell(width, across), 3 => to_cell(0, across), _ => to_cell(across, 0) };
+            match outside(self, cell) {
+                Some(true) => return Some(cell),
+                Some(false) => {}
+                None => { self.diagnose_campaign_paradrop(aircraft, "EdgeHeight", "This original edge candidate needs the height/bridge-sensitive radar predicate."); return None; }
+            }
+        }
+        Some(to_cell(1, width / 2))
+    }
+
+    fn campaign_drop_one(&mut self, index: usize, plane: &mut Plane) {
+        let carrier = &self.units[index];
+        let Some(passenger) = carrier.cargo.last() else { return; };
+        let carrier_id = carrier.id;
+        if !passenger.stats.infantry || !passenger.cargo.is_empty() {
+            self.diagnose_campaign_paradrop(carrier_id, "CargoClass", "Noninfantry or nested cargo needs its class-specific original SpawnParachuted path; the head remains aboard.");
+            return;
+        }
+        let (x, y) = native_drop_position(carrier.x, carrier.y, carrier.turn.current(), plane.ammo);
+        let release_z = self.floor(carrier.x, carrier.y) + plane.z;
+        let cell = cell_of(x, y);
+        let Some(at) = self.map.index(cell.0, cell.1).filter(|_| self.map.in_playfield(cell.0, cell.1)) else { return; };
+        if self.map.bridged(cell.0, cell.1) || self.map.ramp(cell.0, cell.1) != 0 || release_z <= self.floor(x, y) {
+            self.diagnose_campaign_paradrop(carrier_id, "DropTerrain", "This release needs the original bridge/slope or nonairborne parachute path; the same cargo head is retained.");
+            return;
+        }
+        let others = self.others();
+        let level = if self.mission_data.as_ref().is_some_and(|data| data.yuri) { -1 } else { 0 };
+        if crate::entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, passenger, cell, None, passenger.cell(), level) != crate::code::OK { return; }
+        let taken = self.spots[at] | self.map.tree_bits[at];
+        let order = match crate::spot_index(x, y) {
+            2 => [2, 4, 3], 3 => [3, 4, 2], 4 => [4, 2, 3],
+            _ => [[2, 3, 4], [2, 3, 4], [3, 4, 2], [4, 2, 3]][self.scenario_random_range(0, 3) as usize],
+        };
+        let Some(spot) = order.into_iter().find(|&spot| taken & (1 << spot) == 0) else { return; };
+        let mut passenger = self.units[index].cargo.pop().unwrap();
+        let id = passenger.id;
+        (passenger.x, passenger.y) = (cell.0 * LEPTONS_PER_CELL + crate::SPOT_OFFSETS[spot].0, cell.1 * LEPTONS_PER_CELL + crate::SPOT_OFFSETS[spot].1);
+        passenger.set_facing(0x80);
+        passenger.falling = Some(release_z - self.floor(passenger.x, passenger.y));
+        passenger.dropped_at = self.tick;
+        self.spots[at] |= 1 << spot;
+        self.spot_house[at] = passenger.owner;
+        let human = self.houses.get(passenger.owner as usize).is_some_and(|house| house.human);
+        self.put_back(passenger);
+        self.queue_parachuted_mission(id, human);
+        self.events.push(crate::combat::Event::Parachuted { unit: id, from: carrier_id });
+        plane.ammo = plane.ammo.wrapping_sub(1);
+        plane.passes = 5;
     }
 
     /// An aircraft strafes when its first weapon's

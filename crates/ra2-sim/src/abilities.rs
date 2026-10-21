@@ -109,7 +109,7 @@ pub struct Leap {
     pub facing: u8,
     speed: f64,
     target: u32,
-    biter: Unit,
+    pub(crate) biter: Unit,
 }
 
 /// The house of a disguise that is a tree, not a unit.
@@ -229,7 +229,8 @@ impl World {
         }
         if warhead.mind_control {
             if let (Some(Aim::Unit(controller) | Aim::Building(controller)), Aim::Unit(victim)) = (by, target) {
-                self.capture_mind(controller, victim, weapon.damage, weapon.infinite_mind_control);
+                self.diagnose_mission_mind_control_notification(target);
+                self.capture_mind(controller, victim, weapon.mind_control_capacity.unwrap_or(weapon.damage), weapon.infinite_mind_control);
             }
             return true;
         }
@@ -710,7 +711,7 @@ impl World {
     /// Puts something that was off the map on a cell, if the cell will have it.
     pub(crate) fn set_down(&mut self, mut unit: Unit, cell: (i32, i32)) -> bool {
         let others: Vec<Other> = self.others();
-        let free = entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), &others, &self.buildings, &unit, cell, None, cell, -1) == code::OK;
+        let free = entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, &unit, cell, None, cell, -1) == code::OK;
         let Some(at) = self.map.index(cell.0, cell.1).filter(|_| free) else {
             return false;
         };
@@ -1150,7 +1151,7 @@ impl World {
         let mut out = Vec::new();
         for mut rider in riders {
             let others: Vec<Other> = self.others();
-            let free = entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), &others, &self.buildings, &rider, cell, None, cell, -1) == code::OK;
+            let free = entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, &rider, cell, None, cell, -1) == code::OK;
             let Some(at) = self.map.index(cell.0, cell.1).filter(|_| free) else {
                 continue;
             };
@@ -1229,6 +1230,35 @@ mod mind_control_tests {
         }
         assert_eq!(world.mind_controlled_units(tower), victims[4..7]);
         assert_eq!(world.unit(victims[7]).unwrap().owner, 2);
+    }
+
+    #[test]
+    fn ra2_capacity_override_replaces_one_link_without_changing_damage_and_yr_keeps_damage_limit() {
+        for ra2 in [true, false] {
+            let (mut world, controller, victims) = field(4);
+            world.weapons[0].infinite_mind_control = false;
+            world.weapons[0].damage = if ra2 { 10 } else { 3 };
+            world.weapons[0].mind_control_capacity = ra2.then_some(1);
+            world.projectiles = vec![Projectile { inviso: true, ..Projectile::default() }];
+            let fighter = world.unit(controller).unwrap().stats.fighter;
+            let mut arms = Arms::default();
+            for (index, &victim) in victims.iter().enumerate() {
+                let from = world.aim_point(Aim::Unit(controller)).unwrap();
+                assert_eq!(world.fire(Aim::Unit(controller), from, 0, 0, 1, &fighter, &mut arms, Aim::Unit(victim), 0), ra2 || index < 3);
+                advance(&mut world, 1);
+                assert_eq!(world.unit(victim).unwrap().health, 100);
+            }
+            if ra2 {
+                assert_eq!(world.weapons[0].damage, 10);
+                assert_eq!(world.mind_controlled_units(controller), vec![victims[3]]);
+                for &released in &victims[..3] {
+                    assert_eq!(world.unit(released).unwrap().owner, 2);
+                }
+            } else {
+                assert_eq!(world.mind_controlled_units(controller), victims[..3]);
+                assert_eq!(world.unit(victims[3]).unwrap().owner, 2);
+            }
+        }
     }
 
     #[test]

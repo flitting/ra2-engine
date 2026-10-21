@@ -215,7 +215,7 @@ impl World {
         let probe = Unit::new(u32::MAX - 1, site.owner, site.centre(), 0x80, stats);
         let others: Vec<Other> = self.others();
         site.perimeter().into_iter().find(|&cell| self.map.in_playfield(cell.0, cell.1)
-            && crate::entry_code(&self.map, &self.claims, (&self.spots, &self.spot_house), &others, &self.buildings, &probe, cell, None, probe.cell(), -1) == code::OK)
+            && crate::entry_code(&self.map, &self.claims, &self.stacked_claims, (&self.spots, &self.spot_house), &others, &self.buildings, &probe, cell, None, probe.cell(), -1) == code::OK)
     }
 
     fn slave_ore(&self, index: usize, site: Site) -> Option<(i32, i32)> {

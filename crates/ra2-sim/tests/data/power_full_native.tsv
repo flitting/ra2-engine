@@ -1,0 +1,13 @@
+# Original YR TEvent58 + original House.PowerPercent raw signed counters; no stubs.
+# output drain expected_full
+-1	1	0
+0	0	1
+0	1	0
+1	0	1
+1	1	1
+99	100	0
+100	99	1
+100	100	1
+2147483647	2147483647	1
+-2147483648	-2147483647	1
+-2147483647	-2147483648	1

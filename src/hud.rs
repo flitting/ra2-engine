@@ -763,13 +763,14 @@ fn update_sidebar(
     let hud = &mut *hud;
     let (unit_catalog, super_catalog, prefs) = catalogs;
     let now = time.elapsed_secs();
+    let input_locked = sim.0.mission_input_locked();
     let Some(house) = sim.0.houses.get(local() as usize).cloned() else {
         return;
     };
     let slots = hud.rows * 2;
 
     // The mouse, in the sidebar's own coordinates.
-    let mouse = pointer.0.map(|at| Vec2::new(at.x - (window.width() - SIDEBAR_WIDTH), at.y));
+    let mouse = pointer.0.filter(|_| !input_locked).map(|at| Vec2::new(at.x - (window.width() - SIDEBAR_WIDTH), at.y));
     // What each tab holds, and what is in hand in it.
     // Buildings other than defences, defences,
     // infantry, then vehicles with aircraft and ships.
@@ -831,7 +832,7 @@ fn update_sidebar(
     // The keys are silent, do nothing for an
     // empty tab, and the first two also pick up a finished building to place.
     for (key, tab) in [(KeyCode::KeyQ, 0), (KeyCode::KeyW, 1), (KeyCode::KeyE, 2), (KeyCode::KeyR, 3)] {
-        if keys.just_pressed(key) && enabled[tab] {
+        if !input_locked && keys.just_pressed(key) && enabled[tab] {
             hud.tab = tab;
             if let Some(ready) = house.slot(tab == 1).filter(|p| tab < 2 && p.is_ready()) {
                 placing.0.get_or_insert(ready.building);

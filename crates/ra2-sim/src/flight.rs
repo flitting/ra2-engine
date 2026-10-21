@@ -115,7 +115,7 @@ fn clearance(unit: &Unit, jet: &Jet, ground: &Ground) -> i32 {
         let (cx, cy) = cell_centre(cell);
         let mut h = floor(ground.map, cx, cy);
         let built = ground.buildings.iter().any(|b| (b.cell.0..b.cell.0 + b.size.0).contains(&cell.0) && (b.cell.1..b.cell.1 + b.size.1).contains(&cell.1));
-        let held = ground.map.index(cell.0, cell.1).is_some_and(|i| ground.claims[i] != 0 || ground.spots[i] & SPOT_BITS != 0);
+        let held = ground.map.index(cell.0, cell.1).is_some_and(|i| ground.claims[i] != 0 || ground.spots[i] & ALL_SPOT_BITS != 0);
         if built {
             h += 4 * combat::LEVEL_HEIGHT;
         } else if held {

@@ -71,7 +71,7 @@ impl Mode {
     pub(crate) fn toggle(&mut self, which: Mode, sim: &World, selection: &mut Selection, placing: &Placing) {
         if *self == which {
             *self = Mode::None;
-        } else if placing.0.is_none() && sim.buildings().iter().any(|b| b.owner == local()) {
+        } else if placing.0.is_none() && sim.buildings().iter().any(|b| sim.house_controlled_by(b.owner, local())) {
             *self = which;
             selection.0.clear();
         }
@@ -198,6 +198,19 @@ struct Overlay;
 
 pub struct ControlPlugin;
 
+pub(crate) fn input_allowed(sim: Option<Res<Sim>>) -> bool {
+    sim.is_none_or(|sim| !sim.0.mission_input_locked())
+}
+
+fn clear_locked_interaction(sim: Res<Sim>, mut band: ResMut<Band>, mut mode: ResMut<Mode>, mut placing: ResMut<Placing>, mut cursor: ResMut<WantedCursor>) {
+    if sim.0.mission_input_locked() {
+        *band = Band::default();
+        *mode = Mode::None;
+        placing.0 = None;
+        cursor.0 = cursor::NORMAL;
+    }
+}
+
 impl Plugin for ControlPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Selection>()
@@ -212,7 +225,7 @@ impl Plugin for ControlPlugin {
             .add_systems(OnExit(Screen::InGame), |mut wanted: ResMut<WantedCursor>| wanted.0 = cursor::NORMAL)
             .add_systems(
                 Update,
-                (select_later, hover, shortcuts, clicks, run_plans, choose_cursor, draw_overlays, draw_sensor_lines)
+                (clear_locked_interaction, select_later, hover, shortcuts.run_if(input_allowed), clicks.run_if(input_allowed), run_plans, choose_cursor.run_if(input_allowed), draw_overlays, draw_sensor_lines)
                     .chain()
                     .run_if(in_state(Screen::InGame))
                     .run_if(crate::pause::playing)
@@ -374,7 +387,7 @@ fn hover(
     // Nothing under the shroud can be pointed at.
     let hidden = |target: &Target| match *target {
         // Nor a cloaked unit no sensor finds.
-        Target::Unit(id) => sim.0.unit(id).is_some_and(|unit| unit.owner != local() && (sim.0.map.shrouded(unit.cell().0, unit.cell().1) || sim.0.hidden_from(unit, local()))),
+        Target::Unit(id) => sim.0.unit(id).is_some_and(|unit| !sim.0.house_controlled_by(unit.owner, local()) && (sim.0.map.shrouded(unit.cell().0, unit.cell().1) || sim.0.hidden_from(unit, local()))),
         Target::Building(_) => sim.0.map.shrouded(cell.0, cell.1),
     };
     hover.target = unit.filter(|target| !hidden(target)).or_else(|| building().filter(|target| !hidden(target)));
@@ -395,8 +408,8 @@ fn placement_origin(sim: &World, cell: (i32, i32), building: u16) -> (i32, i32) 
 
 fn owned_by_player(sim: &World, target: Target) -> bool {
     match target {
-        Target::Unit(id) => sim.unit(id).is_some_and(|unit| unit.owner == local()) && !sim.is_enslaved(id),
-        Target::Building(id) => sim.buildings().iter().any(|b| b.id == id && b.owner == local()),
+        Target::Unit(id) => sim.unit(id).is_some_and(|unit| sim.house_controlled_by(unit.owner, local())) && !sim.is_enslaved(id),
+        Target::Building(id) => sim.buildings().iter().any(|b| b.id == id && sim.house_controlled_by(b.owner, local())),
     }
 }
 
@@ -489,8 +502,8 @@ fn shortcuts(
             .0
             .iter()
             .filter_map(|&target| match target {
-                Target::Unit(id) => world.unit(id).filter(|u| u.owner == local()).map(|u| (false, u.stats.kind)),
-                Target::Building(id) => world.buildings().iter().find(|b| b.id == id && b.owner == local()).map(|b| (true, b.kind)),
+                Target::Unit(id) => world.unit(id).filter(|u| world.house_controlled_by(u.owner, local())).map(|u| (false, u.stats.kind)),
+                Target::Building(id) => world.buildings().iter().find(|b| b.id == id && world.house_controlled_by(b.owner, local())).map(|b| (true, b.kind)),
             })
             .collect();
         // The status line it leaves.
@@ -504,13 +517,13 @@ fn shortcuts(
                 let units = world
                     .units()
                     .iter()
-                    .filter(|u| u.owner == local() && kinds.contains(&(false, u.stats.kind)))
+                    .filter(|u| world.house_controlled_by(u.owner, local()) && kinds.contains(&(false, u.stats.kind)))
                     .filter(|u| whole || seen(unit_point(world, &view, u)))
                     .map(|u| Target::Unit(u.id));
                 let buildings = world
                     .buildings()
                     .iter()
-                    .filter(|b| b.owner == local() && kinds.contains(&(true, b.kind)))
+                    .filter(|b| world.house_controlled_by(b.owner, local()) && kinds.contains(&(true, b.kind)))
                     .filter(|b| {
                         let level = world.map.level(b.cell.0, b.cell.1) as i32;
                         whole || seen(scene_point(view.origin, b.cell.0 * LEPTONS_PER_CELL, b.cell.1 * LEPTONS_PER_CELL, level))
@@ -545,12 +558,12 @@ fn shortcuts(
     };
 
     if keys.just_pressed(KeyCode::KeyH) {
-        let mine = || world.buildings().iter().filter(|b| b.owner == local());
+        let mine = || world.buildings().iter().filter(|b| world.house_controlled_by(b.owner, local()));
         let yard = mine().find(|b| catalog.0.get(b.kind as usize).is_some_and(|entry| entry.construction_yard));
         let target = yard
             .or_else(|| mine().next())
             .map(|b| Target::Building(b.id))
-            .or_else(|| world.units().iter().find(|u| u.owner == local()).map(|u| Target::Unit(u.id)));
+            .or_else(|| world.units().iter().find(|u| world.house_controlled_by(u.owner, local())).map(|u| Target::Unit(u.id)));
         centre_on.0 = target.and_then(point_of);
     }
     if keys.just_pressed(KeyCode::Numpad5) {
@@ -560,9 +573,9 @@ fn shortcuts(
         let all: Vec<Target> = world
             .units()
             .iter()
-            .filter(|u| u.owner == local())
+            .filter(|u| world.house_controlled_by(u.owner, local()))
             .map(|u| Target::Unit(u.id))
-            .chain(world.buildings().iter().filter(|b| b.owner == local()).map(|b| Target::Building(b.id)))
+            .chain(world.buildings().iter().filter(|b| world.house_controlled_by(b.owner, local())).map(|b| Target::Building(b.id)))
             .collect();
         let at = selection.0.first().and_then(|now| all.iter().position(|t| t == now));
         if let Some(&next) = all.get(at.map_or(0, |at| (at + 1) % all.len().max(1))) {
@@ -868,7 +881,7 @@ fn clicks(
         // of the player's with soldiers in it, they come out and nothing else
         // is done.
         if let Some(Target::Building(building)) = selection.0.first().copied() {
-            if sim.0.buildings().iter().any(|b| b.id == building && b.owner == local() && !b.occupants.is_empty()) {
+            if sim.0.buildings().iter().any(|b| b.id == building && sim.0.house_controlled_by(b.owner, local()) && !b.occupants.is_empty()) {
                 sim.give(Order::Evacuate { building });
                 return;
             }
@@ -930,7 +943,7 @@ fn clicks(
             let mut spoke = false;
             for (id, owner) in caught {
                 let target = Target::Unit(id);
-                if owner != local() || selection.0.contains(&target) {
+                if !sim.0.house_controlled_by(owner, local()) || selection.0.contains(&target) {
                     continue;
                 }
                 selection.0.push(target);
@@ -1131,14 +1144,14 @@ fn run_plans(
     mut status: MessageWriter<crate::bar::Status>,
     mut cues: MessageWriter<Cue>,
 ) {
-    if keys.just_pressed(KeyCode::KeyZ) && !planning.0 {
+    if !sim.0.mission_input_locked() && keys.just_pressed(KeyCode::KeyZ) && !planning.0 {
         planning.0 = true;
         if !std::mem::replace(&mut plans.said_key, true) {
             status.write(crate::bar::Status::Key("MSG:PlanningModeIntro1Key"));
         }
         status.write(crate::bar::Status::Key("MSG:PlanningModeIntro3"));
     }
-    if keys.just_released(KeyCode::KeyZ) && planning.0 {
+    if !sim.0.mission_input_locked() && keys.just_released(KeyCode::KeyZ) && planning.0 {
         planning.0 = false;
     }
     if planning.0 != plans.was_on {

@@ -28,6 +28,7 @@ pub struct TerrainObject {
 /// A building from `[Structures]`.
 #[derive(Clone, Debug)]
 pub struct Structure {
+    pub id: String,
     pub owner: String,
     pub kind: String,
     /// 0 to 256.
@@ -35,11 +36,14 @@ pub struct Structure {
     /// The top cell of its foundation.
     pub x: i32,
     pub y: i32,
+    pub facing: u8,
+    pub tag: Option<String>,
 }
 
 /// A foot soldier, civilian or animal from `[Infantry]`.
 #[derive(Clone, Debug)]
 pub struct Infantry {
+    pub id: String,
     pub owner: String,
     pub kind: String,
     pub health: i32,
@@ -49,11 +53,16 @@ pub struct Infantry {
     pub sub_cell: u8,
     /// 0 to 255, clockwise from north.
     pub facing: u8,
+    pub mission: String,
+    pub tag: Option<String>,
+    pub veterancy: f64,
+    pub group: i32,
 }
 
 /// A vehicle from `[Units]`.
 #[derive(Clone, Debug)]
 pub struct Unit {
+    pub id: String,
     pub owner: String,
     pub kind: String,
     pub health: i32,
@@ -61,6 +70,10 @@ pub struct Unit {
     pub y: i32,
     /// 0 to 255, clockwise from north.
     pub facing: u8,
+    pub mission: String,
+    pub tag: Option<String>,
+    pub veterancy: f64,
+    pub group: i32,
 }
 
 /// Overlays are stored for a fixed 512x512 grid of cells.
@@ -79,6 +92,8 @@ pub struct Map {
     pub structures: Vec<Structure>,
     pub infantry: Vec<Infantry>,
     pub units: Vec<Unit>,
+    /// Preplaced aircraft use the vehicle row layout, in a separate registry.
+    pub aircraft: Vec<Unit>,
     /// Overlay type index per cell of the overlay grid; empty if the map has none.
     overlay: Vec<u8>,
     /// Per-cell overlay state, such as the amount of ore.
@@ -86,6 +101,12 @@ pub struct Map {
 }
 
 const ISO_TILE_LEN: usize = 11;
+
+fn object_tag(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("<none>") && !value.eq_ignore_ascii_case("none"))
+        .then(|| value.to_owned())
+}
 
 /// Joins the numbered lines of a packed section and decodes them from base64.
 fn packed_section(ini: &Ini, section: &str) -> Option<Vec<u8>> {
@@ -178,14 +199,17 @@ impl Map {
         let structures = ini
             .section("Structures")
             .iter()
-            .filter_map(|(_, value)| {
+            .filter_map(|(id, value)| {
                 let fields: Vec<&str> = value.split(',').map(str::trim).collect();
                 Some(Structure {
+                    id: id.clone(),
                     owner: fields.first()?.to_string(),
                     kind: fields.get(1)?.to_string(),
                     health: fields.get(2)?.parse().ok()?,
                     x: fields.get(3)?.parse().ok()?,
                     y: fields.get(4)?.parse().ok()?,
+                    facing: fields.get(5).and_then(|v| v.parse().ok()).unwrap_or(0),
+                    tag: fields.get(6).and_then(|value| object_tag(value)),
                 })
             })
             .collect();
@@ -193,9 +217,10 @@ impl Map {
         let infantry = ini
             .section("Infantry")
             .iter()
-            .filter_map(|(_, value)| {
+            .filter_map(|(id, value)| {
                 let fields: Vec<&str> = value.split(',').map(str::trim).collect();
                 Some(Infantry {
+                    id: id.clone(),
                     owner: fields.first()?.to_string(),
                     kind: fields.get(1)?.to_string(),
                     health: fields.get(2)?.parse().ok()?,
@@ -203,25 +228,36 @@ impl Map {
                     y: fields.get(4)?.parse().ok()?,
                     sub_cell: fields.get(5)?.parse().ok()?,
                     facing: fields.get(7)?.parse().ok()?,
+                    mission: fields.get(6).unwrap_or(&"Guard").to_string(),
+                    tag: fields.get(8).and_then(|value| object_tag(value)),
+                    veterancy: fields.get(9).and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                    group: fields.get(10).and_then(|v| v.parse().ok()).unwrap_or(-1),
                 })
             })
             .collect();
         // `owner,type,health,x,y,facing,mission,tag,veterancy,group,...`.
-        let units = ini
-            .section("Units")
+        let mobile_objects = |section| ini
+            .section(section)
             .iter()
-            .filter_map(|(_, value)| {
+            .filter_map(|(id, value)| {
                 let fields: Vec<&str> = value.split(',').map(str::trim).collect();
                 Some(Unit {
+                    id: id.clone(),
                     owner: fields.first()?.to_string(),
                     kind: fields.get(1)?.to_string(),
                     health: fields.get(2)?.parse().ok()?,
                     x: fields.get(3)?.parse().ok()?,
                     y: fields.get(4)?.parse().ok()?,
                     facing: fields.get(5)?.parse().ok()?,
+                    mission: fields.get(6).unwrap_or(&"Guard").to_string(),
+                    tag: fields.get(7).and_then(|value| object_tag(value)),
+                    veterancy: fields.get(8).and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                    group: fields.get(9).and_then(|v| v.parse().ok()).unwrap_or(-1),
                 })
             })
-            .collect();
+            .collect::<Vec<Unit>>();
+        let units = mobile_objects("Units");
+        let aircraft = mobile_objects("Aircraft");
         let overlay = overlay_grid(&ini, "OverlayPack");
         let overlay_data = overlay_grid(&ini, "OverlayDataPack");
 
@@ -229,6 +265,7 @@ impl Map {
             structures,
             infantry,
             units,
+            aircraft,
             terrain_objects,
             overlay,
             overlay_data,
@@ -260,5 +297,23 @@ impl Map {
         let index = (y * grid + x) as usize;
         let kind = *self.overlay.get(index)?;
         (kind != NO_OVERLAY).then(|| (kind, self.overlay_data.get(index).copied().unwrap_or(0)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placement_identity_missions_and_aircraft_survive_map_parsing() {
+        let map = Map::parse(b"[Map]\nSize=0,0,2,2\nTheater=TEMPERATE\n[IsoMapPack5]\n1=\n[Units]\n7=Player,TANK,128,1,2,64,Sleep,None,2.0,5\n[Aircraft]\n7=Enemy,ORCA,200,2,1,192,Area Guard,ABCD,1.0,-1\n[Infantry]\n9=Player,E1,64,1,1,3,Hunt,32,0,0.5,6\n[Structures]\n11=Enemy,NAPOWR,192,2,2,128,EF01\n").unwrap();
+        let unit = &map.units[0];
+        assert_eq!((unit.id.as_str(), unit.mission.as_str(), unit.facing, unit.health, unit.veterancy, unit.group), ("7", "Sleep", 64, 128, 2.0, 5));
+        assert!(unit.tag.is_none());
+        let aircraft = &map.aircraft[0];
+        assert_eq!((aircraft.id.as_str(), aircraft.kind.as_str(), aircraft.mission.as_str(), aircraft.tag.as_deref()), ("7", "ORCA", "Area Guard", Some("ABCD")));
+        let infantry = &map.infantry[0];
+        assert_eq!((infantry.sub_cell, infantry.facing, infantry.group, infantry.tag.as_deref()), (3, 32, 6, None));
+        assert_eq!((map.structures[0].facing, map.structures[0].tag.as_deref()), (128, Some("EF01")));
     }
 }

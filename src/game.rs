@@ -248,6 +248,9 @@ pub struct CentreOn(pub Option<Vec2>);
 #[derive(Resource, Default)]
 pub struct ViewCentre(pub Vec2);
 
+#[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CameraScrollSet;
+
 pub struct GamePlugin;
 
 impl Plugin for GamePlugin {
@@ -261,7 +264,7 @@ impl Plugin for GamePlugin {
             .add_systems(OnExit(Screen::InGame), reset_camera)
             .add_systems(
                 Update,
-                (scroll_camera.run_if(crate::pause::playing), animate_map).run_if(in_state(Screen::InGame)),
+                (scroll_camera.run_if(crate::pause::playing).in_set(CameraScrollSet).after(crate::campaign::CampaignPresentationSet), animate_map).run_if(in_state(Screen::InGame)),
             );
     }
 }
@@ -274,11 +277,34 @@ pub(crate) struct DrawnCountry(pub usize);
 #[derive(Resource)]
 pub(crate) struct DrawnColour(pub usize);
 
+fn campaign_seed() -> u32 {
+    // The original setup reseeds Scenario.Random from GetTickCount unless a
+    // nonzero seed override is supplied. A boot-relative millisecond clock
+    // provides that source on Unix; it does not make a map's random seed fixed.
+    if let Some(seed) = std::env::var("RA2_CAMPAIGN_SEED").ok().and_then(|text| text.parse::<u32>().ok()).filter(|seed| *seed != 0) { return seed }
+    boot_millis() as u32
+}
+
+pub(crate) fn boot_millis() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut clock = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // clock_gettime initializes the output only when it reports success.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, clock.as_mut_ptr()) } == 0 {
+            let clock = unsafe { clock.assume_init() };
+            return (clock.tv_sec as u64).wrapping_mul(1000).wrapping_add(clock.tv_nsec as u64 / 1_000_000);
+        }
+    }
+    // A fallback supplies fresh variation on hosts without that clock API.
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
 pub(crate) fn load_map(
     mut commands: Commands,
     files: Res<GameFiles>,
     setup: Res<GameSetup>,
     pending: Option<Res<crate::saves::PendingLoad>>,
+    pending_campaign: Option<Res<crate::campaign::PendingCampaign>>,
     seat: Option<Res<crate::net::NetSeat>>,
     lobby: Option<Res<crate::net::Lobby>>,
     mut images: ResMut<Assets<Image>>,
@@ -292,7 +318,27 @@ pub(crate) fn load_map(
     // loading screen before.
     // Any selectable country in this edition, any of the
     // eight colours. Not original behaviour: the clock as the source of chance.
-    let options = setup.options;
+    let campaign_run = pending.as_ref().and_then(|pending| pending.0.campaign.clone())
+        .or_else(|| pending_campaign.as_ref().map(|pending| pending.0.clone()));
+    if campaign_run.is_some() && seat.is_some() {
+        error!("campaign sessions cannot enter a multiplayer lobby");
+        next_screen.set(Screen::Skirmish);
+        return;
+    }
+    if campaign_run.as_ref().is_some_and(|run| run.edition != files.edition()) {
+        error!("campaign edition differs from mounted game files");
+        next_screen.set(Screen::NewCampaign);
+        return;
+    }
+    let mut options = setup.options;
+    if campaign_run.is_some() {
+        options.opponents = [Opponent::NONE; 7];
+        options.unit_count = 0;
+        options.crates = false;
+        options.short_game = false;
+    } else {
+        commands.remove_resource::<crate::campaign::ActiveCampaign>();
+    }
     let countries = files.get("rules.ini").map(ra2_formats::ini::Ini::parse)
         .map(|rules| terrain::multiplayer_countries(&rules)).filter(|countries| !countries.is_empty()).unwrap_or_else(|| vec![0]);
     // Drawn in this order: the human's
@@ -363,10 +409,13 @@ pub(crate) fn load_map(
         .get(&format!("{}.map", setup.map))
         .or_else(|| files.get(&format!("{}.mpr", setup.map)))
         .and_then(Map::parse)
-        .and_then(|map| terrain::build(&files, &map, &player));
+        .and_then(|map| match &campaign_run {
+            Some(run) => crate::campaign_world::build_scene(&files, &map, run).map_err(|error| error!("campaign initialization: {error}")).ok(),
+            None => terrain::build(&files, &map, &player),
+        });
     let Some(mut scene) = scene else {
         error!("could not load map {}", setup.map);
-        next_screen.set(Screen::Skirmish);
+        next_screen.set(if campaign_run.is_some() { Screen::NewCampaign } else { Screen::Skirmish });
         return;
     };
     info!("the player starts at {:?}", scene.player_start);
@@ -397,11 +446,23 @@ pub(crate) fn load_map(
             "rule configuration needs engine support");
     }
 
+    if let Some(init) = &mut scene.scenario { init.random_seed = campaign_seed(); }
     let mut built = crate::units::build_world(&files, &mut scene);
+    if let Some(init) = &scene.scenario {
+        if let Err(reason) = crate::campaign_world::attach(&mut built.world, init, &scene.scenario_objects) {
+            error!("campaign runtime: {reason}");
+            next_screen.set(Screen::NewCampaign);
+            return;
+        }
+        built.world.set_mission_presentation_managed(true);
+        commands.remove_resource::<crate::campaign::PendingCampaign>();
+        commands.insert_resource(crate::campaign::ActiveCampaign(init.run.clone()));
+    }
     let built_levels: std::collections::HashMap<(i32, i32), i32> =
         scene.placements.iter().map(|p| p.light_cell).map(|cell| (cell, built.world.map.level(cell.0, cell.1) as i32)).collect();
     commands.insert_resource(std::mem::take(&mut scene.radar_ground));
     commands.insert_resource(scene.armoury.clone());
+    commands.insert_resource(crate::radar::RadarEvents(Vec::new(), scene.radar_rules.clone()));
     commands.insert_resource(crate::lighting::WorldLight::new(std::mem::take(&mut scene.light_setup)));
     commands.insert_resource(crate::lighting::StormLight::default());
     // A computer house
@@ -410,10 +471,11 @@ pub(crate) fn load_map(
     // RA2_LOCAL=n sits this machine's player at house n (2 is the first
     // computer house), for looking at a game from another seat.
     let networked = seat.is_some();
-    terrain::set_local(seat.map(|seat| seat.0).or(std::env::var("RA2_LOCAL").ok().and_then(|n| n.trim().parse().ok())).unwrap_or(terrain::PLAYER));
+    terrain::set_local(scene.scenario.as_ref().map(|init| init.local).or_else(|| seat.map(|seat| seat.0).or(std::env::var("RA2_LOCAL").ok().and_then(|n| n.trim().parse().ok()))).unwrap_or(terrain::PLAYER));
     built.world.map.viewer = terrain::local();
     // The sidebar art is the player's side's.
     files.set_side(built.world.houses.get(terrain::local() as usize).map_or(0, |house| house.side.max(0) as usize));
+    if campaign_run.is_none() {
     let bonus = built.world.ai_rules.credit_bonus;
     for house in built.world.houses.iter_mut().skip(terrain::PLAYER as usize) {
         house.credits = options.credits;
@@ -433,6 +495,7 @@ pub(crate) fn load_map(
         built.world.start_crates(people);
         info!("crates at {:?}", built.world.crates().iter().map(|c| c.cell).collect::<Vec<_>>());
     }
+    }
     // RA2_CRATE=x,y puts a crate (of random content) at that cell, for checks.
     if let Some((x, y)) = std::env::var("RA2_CRATE").ok().and_then(|v| v.split_once(',').and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))) {
         built.world.put_crate_for_tests((x, y), 0xff);
@@ -441,6 +504,9 @@ pub(crate) fn load_map(
     let label = |key: &str| strings.as_ref().and_then(|strings| strings.get(key)).unwrap_or(key).to_owned();
     let mut names = vec![String::new(), label("GUI:Player")];
     names.extend(rows.iter().enumerate().map(|(n, row)| if row.level >= crate::net::HUMAN_ROW { format!("{} {}", label("GUI:Player"), n + 2) } else { label(["GUI:AIHard", "GUI:AINormal", "GUI:AIEasy"][row.level.clamp(0, 2) as usize]) }));
+    if let Some(init) = &scene.scenario {
+        names = init.houses.iter().map(|house| house.name.clone()).collect();
+    }
     // The player goes by the name they gave; in a network game, so do the others.
     if let Some(lobby) = &lobby {
         if !lobby.name.is_empty() && lobby.house_names.is_empty() {
@@ -457,7 +523,7 @@ pub(crate) fn load_map(
     // The game is recorded from its start: the world as it begins, and (in
     // `Sim`) every order. A loaded game carries its recording on, or starts
     // one where it was saved.
-    let mut recording = crate::saves::Recording { start: built.world.snapshot(), start_tick: built.world.current_tick(), orders: Vec::new() };
+    let mut recording = crate::saves::Recording { start: built.world.snapshot(), start_tick: built.world.current_tick(), orders: Vec::new(), presentation: Vec::new() };
     if let Some(pending) = pending {
         commands.remove_resource::<crate::saves::PendingLoad>();
         match built.world.restore(&pending.0.state) {
@@ -465,9 +531,24 @@ pub(crate) fn load_map(
                 terrain::set_local(pending.0.local);
                 built.world.map.viewer = pending.0.local;
                 saved_view = Some(pending.0.camera);
-                recording = pending.0.recording.clone().unwrap_or(crate::saves::Recording { start: pending.0.state.clone(), start_tick: pending.0.tick, orders: Vec::new() });
+                if let Some(pan) = &pending.0.camera_pan {
+                    commands.insert_resource(pan.clone());
+                } else {
+                    commands.remove_resource::<crate::campaign::CampaignCameraPan>();
+                }
+                if let Some(audio) = &pending.0.campaign_audio {
+                    commands.insert_resource(crate::audio::PendingCampaignAudio(audio.clone()));
+                } else {
+                    commands.remove_resource::<crate::audio::PendingCampaignAudio>();
+                }
+                commands.insert_resource(crate::radar::RadarEvents(pending.0.radar_events.clone(), scene.radar_rules.clone()));
+                recording = pending.0.recording.clone().unwrap_or(crate::saves::Recording { start: pending.0.state.clone(), start_tick: pending.0.tick, orders: Vec::new(), presentation: Vec::new() });
             }
-            Err(error) => error!("the saved game could not be restored: {error}"),
+            Err(error) => {
+                error!("the saved game could not be restored: {error}");
+                next_screen.set(if campaign_run.is_some() { Screen::NewCampaign } else { Screen::Skirmish });
+                return;
+            },
         }
     }
     commands.insert_resource(recording);
@@ -550,10 +631,15 @@ pub(crate) fn load_map(
                 source: URect::new(entry.x, entry.y, entry.x + entry.width, entry.y + entry.height),
                 at: IVec2::new(placement.x, placement.y),
                 base: placement.ground?,
+                light: crate::lighting::Lit {
+                    cell: placement.light_cell,
+                    level: built_levels.get(&placement.light_cell).copied().unwrap_or(0),
+                    rule: placement.light.unwrap_or(crate::lighting::LightRule::Ground { raise: 0 }),
+                },
             })
         })
         .collect();
-    for (page, mesh) in crate::depth::ground_meshes(&tiles, pages.len(), terrain::PAGE_SIZE).into_iter().enumerate() {
+    for (page, (mesh, light)) in crate::depth::ground_meshes(&tiles, pages.len(), terrain::PAGE_SIZE).into_iter().enumerate() {
         let Some(heights) = heights[page].clone() else {
             continue;
         };
@@ -562,6 +648,7 @@ pub(crate) fn load_map(
             Mesh2d(meshes.add(mesh)),
             MeshMaterial2d(ground.add(crate::depth::GroundMaterial { colours: pages[page].0.clone(), heights })),
             Transform::default(),
+            light,
         ));
     }
     for (number, placement) in scene.placements.iter().enumerate() {
@@ -645,6 +732,8 @@ pub(crate) fn load_map(
     };
     // The camera sits at (x, -y) of the view's start.
     let start = saved_view.map_or(start, |(x, y)| Vec2::new(x, -y));
+    commands.insert_resource(ViewCentre(start));
+    commands.insert_resource(CentreOn(None));
     // The visible area, from the map's width W and
     // `LocalSize` (lx, ly, lw, lh): across from 60 lx - 30 W for 60 lw pixels,
     // down from 15 (W + 2 ly - 5) for 30 lh + 135 (cell (x, y)'s corner is at
@@ -710,6 +799,7 @@ fn scroll_camera(
     mut centre: ResMut<ViewCentre>,
     mut blocked: ResMut<ScrollBlocked>,
     prefs: Res<crate::prefs::Prefs>,
+    sim: Option<Res<crate::units::Sim>>,
     (buttons, mut drag, pointer): (Res<ButtonInput<MouseButton>>, ResMut<RightDrag>, Res<crate::cursor::Pointer>),
 ) {
     let Some(mut view) = view else {
@@ -789,6 +879,10 @@ fn scroll_camera(
         } else if held(KeyCode::ShiftLeft, KeyCode::ShiftRight) {
             step *= 2.5;
         }
+    }
+    if sim.as_ref().is_some_and(|sim| sim.0.mission_input_locked()) {
+        step = Vec2::ZERO;
+        *drag = RightDrag::default();
     }
     // A request to look somewhere: the point goes to the middle of the map view,
     // which is the window less the sidebar and the bar along the bottom.
